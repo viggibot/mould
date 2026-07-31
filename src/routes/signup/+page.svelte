@@ -134,7 +134,7 @@
 
 				<label class="af-check">
 					<input type="checkbox" bind:checked={agree} />
-					<span class="af-note">I agree to the <a class="af-link" href="/terms">Terms</a> and <a class="af-link" href="#">Privacy Policy</a>.</span>
+					<span class="af-note">I agree to the <a class="af-link" href="/terms">Terms</a> and <a class="af-link" href="/privacy">Privacy Policy</a>.</span>
 				</label>
 
 				<button class="btn btn-accent af-btn" type="submit" style="--btn: var(--coral)" disabled={loading}>
