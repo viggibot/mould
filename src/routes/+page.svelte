@@ -7,7 +7,7 @@
 	import MouldTypes from '$lib/components/MouldTypes.svelte';
 	import Materials from '$lib/components/Materials.svelte';
 	import UseCases from '$lib/components/UseCases.svelte';
-	import Manufacture from '$lib/components/Manufacture.svelte';
+	// import Manufacture from '$lib/components/Manufacture.svelte';
 	import CtaBanner from '$lib/components/CtaBanner.svelte';
 	import Faq from '$lib/components/Faq.svelte';
 	import { faqs } from '$lib/content.js';
