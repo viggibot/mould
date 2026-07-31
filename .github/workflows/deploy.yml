@@ -1,52 +1,53 @@
-name: Build & Deploy
+name: Build and Publish Mould Generator
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
+    branches: ['main']
 
 env:
-  IMAGE: ghcr.io/viggibot/mould
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  build-and-push-image:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
+      - name: Log in to the Container registry
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: |
-            ${{ env.IMAGE }}:prod
-            ${{ env.IMAGE }}:${{ github.sha }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod
           build-args: |
             PUBLIC_API_BASE_URL=${{ vars.PUBLIC_API_BASE_URL }}
-            PUBLIC_CLOUDFLARE_KEY=${{ vars.PUBLIC_CLOUDFLARE_KEY }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            PUBLIC_CLOUDFLARE_KEY=${{ secrets.PUBLIC_CLOUDFLARE_KEY }}
 
   deploy:
-    needs: build
-    runs-on: [self-hosted, akritio]
+    needs: build-and-push-image
+    runs-on: ubuntu-latest
+
     steps:
-      - name: Pull & restart on the home server
-        working-directory: /home/artyla/production
-        run: |
-          docker compose pull mould
-          docker compose up -d mould
-          docker image prune -f
+      - name: Deploy to server via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd ~/production
+            docker compose pull mould
+            docker compose up -d --force-recreate mould
