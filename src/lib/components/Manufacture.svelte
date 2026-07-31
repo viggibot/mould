@@ -13,7 +13,7 @@
 				<p class="eyebrow" style="--tint: #fff; --tint-ink: var(--coral)">Powered by {site.poweredBy}</p>
 				<h2>{manufacture.title}</h2>
 				<p class="body">{manufacture.body}</p>
-				<a class="btn btn-accent" href="/studio" style="--btn: var(--coral)">Start in the studio →</a>
+				<a class="btn btn-accent" href="/mould" style="--btn: var(--coral)">Start in the studio →</a>
 			</div>
 
 			<ol class="steps">

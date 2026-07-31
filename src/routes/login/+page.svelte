@@ -104,7 +104,7 @@
 				<div class="af-field">
 					<div class="af-row">
 						<label class="af-label" for="password">Password</label>
-						<a class="af-link" href="/forgot">Forgot?</a>
+						<a class="af-link" href="#">Forgot?</a>
 					</div>
 					<div class="af-inwrap">
 						<input class="af-input" id="password" type={show ? 'text' : 'password'} autocomplete="current-password" placeholder="••••••••" bind:value={password} />

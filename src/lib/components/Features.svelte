@@ -35,7 +35,7 @@
 						<span class="icon">
 							<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{@html icons[i]}</svg>
 						</span>
-						<a class="arrow" href="/studio" aria-label="Open the studio">
+						<a class="arrow" href="/mould" aria-label="Open the studio">
 							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7M9 7h8v8" /></svg>
 						</a>
 					</div>

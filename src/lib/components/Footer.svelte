@@ -20,7 +20,7 @@
 			<nav class="cols" aria-label="Footer">
 				<div class="col">
 					<h4>Product</h4>
-					<a href="/studio">Open the studio</a>
+					<a href="/mould">Open the studio</a>
 					<a href="#features">Features</a>
 					<a href="#how">How it works</a>
 					<a href="#types">FDM vs resin</a>

@@ -24,7 +24,7 @@
 				<span class="aside">(Yes, it's a mold generator too.)</span>
 			</p>
 			<div class="actions" use:reveal={{ delay: 220 }}>
-				<a class="btn btn-accent" href="/studio" style="--btn: var(--violet)">Open the studio →</a>
+				<a class="btn btn-accent" href="/mould" style="--btn: var(--violet)">Open the studio →</a>
 				<a class="btn btn-outline" href="#how">See how it works</a>
 			</div>
 			<p class="trust" use:reveal={{ delay: 300 }}>Free · no login · runs in your browser</p>

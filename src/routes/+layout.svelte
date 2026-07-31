@@ -4,7 +4,7 @@
 	import Footer from '$lib/components/Footer.svelte';
 
 	let { children } = $props();
-	let isStudio = $derived($page.url.pathname.startsWith('/studio'));
+	let isStudio = $derived($page.url.pathname.startsWith('/mould'));
 </script>
 
 {#if isStudio}

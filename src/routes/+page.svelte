@@ -13,7 +13,7 @@
 	import { faqs } from '$lib/content.js';
 </script>
 
-<Seo path="/" {faqs} />
+<SEO path="/" {faqs} />
 
 <Hero />
 <Slicers />
