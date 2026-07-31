@@ -21,15 +21,15 @@
 				<div class="col">
 					<h4>Product</h4>
 					<a href="/mould">Open the studio</a>
-					<a href="#features">Features</a>
-					<a href="#how">How it works</a>
+					<a href="/#features">Features</a>
+					<a href="/#how">How it works</a>
 					<a href="#types">FDM vs resin</a>
 				</div>
 				<div class="col">
 					<h4>Casting</h4>
-					<a href="#uses">Silicone moulds</a>
-					<a href="#uses">Resin moulds</a>
-					<a href="#uses">Concrete moulds</a>
+					<a href="/#uses">Silicone moulds</a>
+					<a href="/#uses">Resin moulds</a>
+					<a href="/#uses">Concrete moulds</a>
 					<a href="#manufacture">Get it printed</a>
 				</div>
 				<div class="col">
