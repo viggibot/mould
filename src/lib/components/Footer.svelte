@@ -20,22 +20,17 @@
 			<nav class="cols" aria-label="Footer">
 				<div class="col">
 					<h4>Product</h4>
-					<a href="/mould">Open the studio</a>
+					<a href="/mould">Open the generator</a>
+					<a href="/docs">Docs</a>
+					<a href="/contact">Contact</a>
+				</div>
+				<div class="col">
+					<h4>Explore</h4>
 					<a href="/#features">Features</a>
 					<a href="/#how">How it works</a>
-					<a href="#types">FDM vs resin</a>
-				</div>
-				<div class="col">
-					<h4>Casting</h4>
-					<a href="/#uses">Silicone moulds</a>
-					<a href="/#uses">Resin moulds</a>
-					<a href="/#uses">Concrete moulds</a>
-					<a href="#manufacture">Get it printed</a>
-				</div>
-				<div class="col">
-					<h4>Help</h4>
-					<a href="#faq">FAQ</a>
-					<a href="#uses">Use cases</a>
+					<a href="/#uses">Use cases</a>
+					<a href="/#manufacture">Get it printed</a>
+					<a href="/#faq">FAQ</a>
 				</div>
 			</nav>
 		</div>
@@ -102,7 +97,7 @@
 	}
 	.cols {
 		display: grid;
-		grid-template-columns: repeat(3, 1fr);
+		grid-template-columns: repeat(2, 1fr);
 		gap: 24px;
 	}
 	.col h4 {
