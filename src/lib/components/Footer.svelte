@@ -29,7 +29,6 @@
 					<a href="/#features">Features</a>
 					<a href="/#how">How it works</a>
 					<a href="/#uses">Use cases</a>
-					<a href="/#manufacture">Get it printed</a>
 					<a href="/#faq">FAQ</a>
 				</div>
 			</nav>
