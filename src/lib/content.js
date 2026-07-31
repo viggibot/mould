@@ -171,20 +171,10 @@ export const faqs = [
 	},
 	{
 		q: 'Who makes this?',
-		a: 'Mould Generator is built and powered by Navi3D, a 3D printing and fabrication studio. Once you generate your mould you can also have Navi3D print it for you in FDM or SLA.'
+		a: 'Mould Generator is built and powered by Navi3D, a 3D printing and fabrication studio. The generator itself is a free online tool — you export your mould as STL files and print them yourself on any FDM or resin printer.'
 	}
 ];
 
-// ---- appended: multi-colour accents + manufacture section -----------------
+// ---- appended: multi-colour accents ---------------------------------------
 export const accents = ['#6c5ce7', '#3b82f6', '#ff7a66', '#17b8a6', '#ec6ec9', '#f6b93b'];
 export const accentTints = ['#efecfd', '#e9f1ff', '#ffeee9', '#e3f7f4', '#fcebf7', '#fdf1da'];
-
-export const manufacture = {
-	title: "No printer? Navi3D makes it for you",
-	body: "Generate and export your mould for free — then let Navi3D manufacture it. We print it in FDM or SLA on production machines, quality-check every piece, and ship it ready to cast, across India.",
-	steps: [
-		{ t: 'You generate', d: 'Design and export your mould in the studio — free, no login.' },
-		{ t: 'Navi3D prints', d: 'We print it in FDM or SLA on calibrated production machines.' },
-		{ t: 'We ship it', d: 'Your finished mould arrives at your door, ready to pour.' }
-	]
-};

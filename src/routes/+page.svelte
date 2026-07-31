@@ -22,6 +22,6 @@
 <MouldTypes />
 <Materials />
 <UseCases />
-<Manufacture />
+<!-- <Manufacture /> -->
 <CtaBanner />
 <Faq />
