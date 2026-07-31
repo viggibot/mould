@@ -1,5 +1,5 @@
 <script>
-	import Seo from '$lib/components/Seo.svelte';
+	import SEO from '$lib/components/SEO.svelte';
 	import Hero from '$lib/components/Hero.svelte';
 	import Slicers from '$lib/components/Slicers.svelte';
 	import Features from '$lib/components/Features.svelte';
