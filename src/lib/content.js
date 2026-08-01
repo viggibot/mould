@@ -22,8 +22,7 @@ export const site = {
 export const stats = [
 	{ big: '±0.01 mm', label: 'CAD-exact cavities' },
 	{ big: '2 · 4 · 6', label: 'part moulds' },
-	{ big: '4 formats', label: 'STL · OBJ · 3MF · STEP' },
-	{ big: '0 login', label: 'runs in your browser' }
+	{ big: '4 formats', label: 'STL · OBJ · 3MF · STEP' }
 ];
 
 // Compatibility strip — the trust/logo-row equivalent.
