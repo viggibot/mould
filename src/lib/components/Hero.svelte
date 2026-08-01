@@ -27,7 +27,7 @@
 				<a class="btn btn-accent" href="/mould" style="--btn: var(--violet)">Open the studio →</a>
 				<a class="btn btn-outline" href="#how">See how it works</a>
 			</div>
-			<p class="trust" use:reveal={{ delay: 300 }}>Free · no login · runs in your browser</p>
+			<p class="trust" use:reveal={{ delay: 300 }}>Free to try · runs in your browser</p>
 
 			<ul class="stats" use:reveal={{ delay: 360 }}>
 				{#each stats as s}

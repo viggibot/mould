@@ -19,6 +19,7 @@
 		</a>
 
 		<nav class="links" aria-label="Primary">
+			<a href="/pricing">Pricing</a>
 			<a href="/docs">Documentation</a>
 			<a href="/contact">Contact</a>
 		</nav>

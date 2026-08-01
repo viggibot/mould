@@ -1,6 +1,7 @@
 <script>
 	import { site } from '$lib/content.js';
 	const year = new Date().getFullYear();
+	const brand = 'Akritio'; // also set site.name = 'Akritio' in content.js
 </script>
 
 <footer class="footer">
@@ -12,8 +13,9 @@
 	<div class="container">
 		<div class="top">
 			<div class="brand">
-				<span class="wordmark">Mould<b>Generator</b></span>
-				<p>Turn 3D models into print-ready moulds for casting. Free, and it runs in your browser.</p>
+				<span class="wordmark">Akritio</span>
+				<p>Akritio turns 3D models into print-ready casting moulds, right in your browser. A product of {site.poweredBy}.</p>
+				<a class="mail" href="mailto:support@akritio.com">support@akritio.com</a>
 				<span class="by">Powered by {site.poweredBy}</span>
 			</div>
 
@@ -21,6 +23,7 @@
 				<div class="col">
 					<h4>Product</h4>
 					<a href="/mould">Open the generator</a>
+					<a href="/pricing">Pricing</a>
 					<a href="/docs">Docs</a>
 					<a href="/contact">Contact</a>
 				</div>
@@ -31,12 +34,17 @@
 					<a href="/#uses">Use cases</a>
 					<a href="/#faq">FAQ</a>
 				</div>
+				<div class="col">
+					<h4>Legal</h4>
+					<a href="/terms">Terms of Service</a>
+					<a href="/privacy">Privacy Policy</a>
+				</div>
 			</nav>
 		</div>
 
 		<div class="bottom">
-			<p class="seo">{site.name} is a free online mould generator — also spelled mold generator — for makers who cast in silicone, resin and concrete.</p>
-			<p class="copyright">© {year} {site.name} · {site.poweredBy}.</p>
+			<p class="seo">{brand} is an online mould generator (also spelled mold generator) for makers who cast in silicone, resin, plaster and concrete.</p>
+			<p class="copyright">© {year} {brand} · a product of {site.poweredBy}.</p>
 		</div>
 	</div>
 </footer>
@@ -72,18 +80,24 @@
 		font-size: 1.2rem;
 		color: #fff;
 	}
-	.wordmark b {
-		font-weight: 500;
-		color: #6b7180;
-	}
 	.brand p {
 		margin-top: 12px;
 		max-width: 30ch;
 		font-size: 0.95rem;
 		line-height: 1.6;
 	}
-	.by {
+	.mail {
 		display: inline-block;
+		margin-top: 10px;
+		font-size: 0.9rem;
+		color: #c7cbd4;
+		transition: color 0.15s ease;
+	}
+	.mail:hover {
+		color: #fff;
+	}
+	.by {
+		display: block;
 		margin-top: 14px;
 		font-family: var(--font-mono);
 		font-size: 0.68rem;
@@ -93,10 +107,11 @@
 		background: var(--coral);
 		padding: 4px 11px;
 		border-radius: 999px;
+		width: fit-content;
 	}
 	.cols {
 		display: grid;
-		grid-template-columns: repeat(2, 1fr);
+		grid-template-columns: repeat(3, 1fr);
 		gap: 24px;
 	}
 	.col h4 {

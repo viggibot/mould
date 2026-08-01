@@ -17,10 +17,11 @@
 			<div class="inner">
 				<p class="eyebrow" style="--tint: var(--coral-t); --tint-ink: var(--coral)">Ready when you are</p>
 				<h2>Make your first mould in the <span class="mark">next five minutes</span></h2>
-				<p class="lede">Upload a model, tune the split, export STL. No sign-up, no cost.</p>
+				<!-- EDIT: replace the benefit text with your actual paid-tier perks -->
+				<p class="lede">Upload a model, tune the split, export STL. Start free — subscribe for unlimited moulds and premium exports.</p>
 				<div class="actions">
 					<a class="btn btn-accent big" href="/mould" style="--btn: var(--coral)">Open the generator →</a>
-					<a class="btn btn-outline" href="/signup">Create an account</a>
+					<a class="btn btn-outline" href="/pricing">See pricing</a>
 				</div>
 				<p class="by">Powered by {site.poweredBy}</p>
 			</div>
