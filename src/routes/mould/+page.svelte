@@ -6,6 +6,11 @@
 	//
 	// Param names match the backend MouldParams serde contract exactly
 	// (snake_case, `mould_type` / `mould_style`). Do not rename them.
+	//
+	// DEVICE SUPPORT: the studio needs a wide landscape canvas (live 3D preview
+	// + two control panels side by side). On phones and tablets held in
+	// portrait, the studio is hidden and a "use a bigger screen" note is shown
+	// instead — handled entirely by CSS media queries (no JS, no load flash).
 	// ==========================================================================
 	import { PUBLIC_API_BASE_URL } from '$env/static/public';
 	import MouldPreview from '$lib/components/MouldPreview.svelte';
@@ -1106,6 +1111,26 @@
 	<input type="file" accept=".stl,.step,.stp,.3mf" bind:this={fileInputEl} onchange={onPick} hidden />
 </div>
 
+<!-- ===================== SMALL-SCREEN / PORTRAIT GATE ===================== -->
+<!-- Mould Studio needs a wide landscape canvas: a live 3D preview with the
+     settings and results panels beside it. On phones (any orientation) and
+     tablets held in portrait we hide the studio and show this note instead.
+     This is a pure-CSS gate (media query in the stylesheet) so there is no load
+     flash and it works without JavaScript. -->
+<div class="gate">
+	<div class="gate-card">
+		<svg class="gate-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+			<rect x="3" y="4" width="18" height="13" rx="2" />
+			<path d="M8 20h8M12 17v3" />
+			<path d="M15.5 8.5l2 2-2 2M8.5 12.5l-2-2 2-2" />
+		</svg>
+		<h1>Open on a bigger screen</h1>
+		<p>Mould Studio needs a wide, landscape canvas — a live 3D preview with all the controls and results beside it. That doesn't fit a phone or a tablet held upright.</p>
+		<p class="gate-hint">On a tablet, just <strong>rotate to landscape</strong>. On a phone, please open this page on a <strong>desktop or a tablet in landscape</strong>.</p>
+		<a class="gate-back" href="/">← Back to site</a>
+	</div>
+</div>
+
 <style>
 	.studio {
 		--ink: #0f172a;
@@ -1718,46 +1743,53 @@
 		color: var(--ink);
 	}
 
-	/* responsive: collapse to viewport + stacked panels */
-	@media (max-width: 1100px) {
+	/* ======================================================================
+	   TABLET-LANDSCAPE OPTIMISATION
+	   Phones and tablet-portrait never reach these rules — they're caught by
+	   the gate below (studio hidden, note shown). So the only "small" screens
+	   that see the studio are tablets in LANDSCAPE (and small laptops). Keep
+	   the full three-pane layout but tighten the side panels so the centre
+	   viewport keeps usable width.
+	   ====================================================================== */
+	@media (min-width: 1000px) and (max-width: 1280px) {
 		.studio {
-			grid-template-columns: 300px 1fr;
-			/* header · navbar · (props + viewport) · inspector */
-			grid-template-rows: 54px auto 1fr auto;
+			grid-template-columns: 250px 1fr 250px;
+			font-size: 13px;
 		}
-		.inspector {
-			grid-column: 1 / -1;
-			grid-row: 4;
-			border-left: none;
-			border-top: 1px solid var(--line);
-			max-height: 42vh;
-		}
-	}
-	@media (max-width: 720px) {
-		.studio {
-			position: absolute;
-			min-height: 100dvh;
-			grid-template-columns: 1fr;
-			/* header · navbar · viewport · props · inspector */
-			grid-template-rows: 54px auto 52vh auto auto;
+		.bar {
+			gap: 12px;
+			padding: 0 12px;
 		}
 		.tabs {
-			grid-row: 2;
+			padding: 6px 12px;
 		}
-		.viewport {
-			grid-row: 3;
+		.tab {
+			padding: 6px 9px;
+			font-size: 12px;
 		}
-		.props {
-			grid-row: 4;
-			border-right: none;
-			border-top: 1px solid var(--line);
+		.props-body,
+		.ins-scroll {
+			padding: 14px 12px 34px;
 		}
-		.inspector {
-			grid-row: 5;
-			max-height: none;
+		.g2 {
+			gap: 10px;
 		}
-		.bar-link {
-			display: none;
+		.res {
+			gap: 10px 12px;
+		}
+	}
+	/* Narrowest tablet landscape (e.g. 1024×768): pull the sidebars in further
+	   so the preview stays comfortably wide. */
+	@media (min-width: 1000px) and (max-width: 1120px) {
+		.studio {
+			grid-template-columns: 228px 1fr 232px;
+		}
+		.seg {
+			padding: 6px 10px;
+			font-size: 12px;
+		}
+		.fchip {
+			max-width: 180px;
 		}
 	}
 
@@ -1765,6 +1797,81 @@
 		.spinner,
 		.pulse {
 			animation: none;
+		}
+	}
+
+	/* ======================================================================
+	   SMALL-SCREEN / PORTRAIT GATE
+	   Hidden on desktop + tablet-landscape. Shown (and the studio hidden) on:
+	     • any portrait orientation  → phones + tablets held upright
+	     • width  ≤ 999px            → phones, very narrow windows
+	     • height ≤ 559px            → phones in landscape (too short)
+	   ====================================================================== */
+	.gate {
+		display: none;
+		position: fixed;
+		inset: 0;
+		z-index: 70;
+		align-items: center;
+		justify-content: center;
+		padding: 28px;
+		background: radial-gradient(ellipse at 50% 28%, #f8fafc 0%, #eef2f7 100%);
+		font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+		color: #0f172a;
+	}
+	.gate-card {
+		max-width: 430px;
+		text-align: center;
+		background: #fff;
+		border: 1px solid #e5e7eb;
+		border-radius: 18px;
+		padding: 36px 26px;
+		box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
+	}
+	.gate-ico {
+		width: 54px;
+		height: 54px;
+		color: #8b5cf6;
+		margin-bottom: 16px;
+	}
+	.gate-card h1 {
+		font-family: 'Space Grotesk', 'Inter', sans-serif;
+		font-size: 20px;
+		font-weight: 700;
+		margin: 0 0 10px;
+	}
+	.gate-card p {
+		font-size: 14px;
+		line-height: 1.6;
+		color: #475569;
+		margin: 0 0 12px;
+	}
+	.gate-hint {
+		font-size: 13px;
+		color: #64748b;
+	}
+	.gate-card strong {
+		color: #0f172a;
+		font-weight: 650;
+	}
+	.gate-back {
+		display: inline-block;
+		margin-top: 14px;
+		font-size: 13px;
+		font-weight: 600;
+		color: #2563eb;
+		text-decoration: none;
+	}
+	.gate-back:hover {
+		text-decoration: underline;
+	}
+
+	@media (orientation: portrait), (max-width: 999.98px), (max-height: 559.98px) {
+		.studio {
+			display: none !important;
+		}
+		.gate {
+			display: flex !important;
 		}
 	}
 </style>
