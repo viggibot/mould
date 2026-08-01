@@ -1,5 +1,6 @@
 <script>
-	import { PUBLIC_API_BASE_URL } from '$env/static/public';
+	import { onMount } from 'svelte';
+	import { PUBLIC_API_BASE_URL, PUBLIC_CLOUDFLARE_KEY } from '$env/static/public';
 
 	const API = PUBLIC_API_BASE_URL;
 
@@ -11,7 +12,47 @@
 	let sent = $state(false);
 	let error = $state('');
 
+	// --- Turnstile state ---
+	let token = $state('');
+	let turnstileEl = $state(null); // bound to the widget container
+	let scriptReady = $state(false);
+	let widgetId;
+
 	const subjects = ['General question', 'Print my mould (Navi3D)', 'Premium & billing', 'Bug or feedback', 'Partnership'];
+
+	// Load the Turnstile script once (client-side only).
+	onMount(() => {
+		if (window.turnstile) {
+			scriptReady = true;
+			return;
+		}
+		const s = document.createElement('script');
+		s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+		s.async = true;
+		s.defer = true;
+		s.onload = () => (scriptReady = true);
+		document.head.appendChild(s);
+	});
+
+	// (Re)render the widget whenever the container is in the DOM and the script
+	// is ready. This also handles the "Send another" case, where the form —
+	// and thus the container — is re-created after a successful send.
+	$effect(() => {
+		if (scriptReady && turnstileEl && window.turnstile) {
+			try { if (widgetId !== undefined) window.turnstile.remove(widgetId); } catch (_) {}
+			widgetId = window.turnstile.render(turnstileEl, {
+				sitekey: PUBLIC_CLOUDFLARE_KEY,
+				callback: (t) => (token = t),
+				'expired-callback': () => (token = ''),
+				'error-callback': () => (token = '')
+			});
+		}
+	});
+
+	function resetTurnstile() {
+		token = '';
+		try { if (widgetId !== undefined && window.turnstile) window.turnstile.reset(widgetId); } catch (_) {}
+	}
 
 	async function submit(e) {
 		e.preventDefault();
@@ -20,13 +61,16 @@
 			error = 'Please fill in your name, email and a message.';
 			return;
 		}
+		if (!token) {
+			error = 'Please complete the verification below.';
+			return;
+		}
 		loading = true;
 		try {
-			// TODO: point this at your contact endpoint (or an email service)
-			const res = await fetch(`${API}/contact`, {
+			const res = await fetch(`${API}/contact/akritio`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ name, email, subject, message })
+				body: JSON.stringify({ name, email, subject, message, cf_turnstile_response: token })
 			});
 			const data = await res.json().catch(() => null);
 			if (!res.ok || (data && data.status === 'error'))
@@ -34,6 +78,7 @@
 			sent = true;
 		} catch (err) {
 			error = err && err.message ? err.message : 'Something went wrong. Please try again.';
+			resetTurnstile(); // tokens are single-use — refresh for the retry
 		} finally {
 			loading = false;
 		}
@@ -44,7 +89,6 @@
 			c: '#6c5ce7',
 			t: '#efecfd',
 			title: 'Email us',
-			// TODO: replace with your real address
 			body: 'hello@mouldgenerator.in',
 			href: 'mailto:hello@mouldgenerator.in',
 			cta: 'Send an email',
@@ -96,7 +140,7 @@
 					</span>
 					<h2>Message sent</h2>
 					<p>Thanks, {name || 'there'} — we've got your message and will reply to {email || 'your email'} soon.</p>
-					<button class="btn btn-outline" onclick={() => { sent = false; name = ''; email = ''; message = ''; }}>Send another</button>
+					<button class="btn btn-outline" onclick={() => { sent = false; name = ''; email = ''; message = ''; token = ''; }}>Send another</button>
 				</div>
 			{:else}
 				<form class="cf-form" onsubmit={submit}>
@@ -124,6 +168,9 @@
 						<label class="cf-label" for="message">Message</label>
 						<textarea class="cf-input cf-area" id="message" rows="5" placeholder="Tell us what you need…" bind:value={message}></textarea>
 					</div>
+
+					<!-- Cloudflare Turnstile -->
+					<div class="cf-turnstile-box" bind:this={turnstileEl}></div>
 
 					<button class="btn btn-accent cf-btn" type="submit" style="--btn: var(--coral)" disabled={loading}>
 						{loading ? 'Sending…' : 'Send message →'}
@@ -223,6 +270,9 @@
 		resize: vertical;
 		min-height: 120px;
 		line-height: 1.6;
+	}
+	.cf-turnstile-box {
+		min-height: 65px;
 	}
 	.cf-btn {
 		width: 100%;
@@ -325,3 +375,4 @@
 		}
 	}
 </style>
+
