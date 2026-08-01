@@ -424,21 +424,38 @@
 		try {
 			const res = await fetch(target, { method: 'GET' });
 			const ct = res.headers.get('content-type') || '';
+			// The server returns a JSON error (with a `code`) instead of a ZIP
+			// when the package is gone (DOWNLOAD_EXPIRED) or came back empty
+			// (DOWNLOAD_EMPTY). Surface the message and let the user regenerate.
 			if (!res.ok || ct.includes('application/json') || ct.includes('text/')) {
 				let msg = `Download failed (HTTP ${res.status}).`;
+				let code = '';
 				try {
 					const j = await res.json();
 					msg = j.message || j.error || msg;
+					code = j.code || '';
 				} catch (_) {}
+				if (code === 'DOWNLOAD_EXPIRED' || code === 'DOWNLOAD_EMPTY') {
+					// the package is no longer downloadable — clear it so the
+					// Generate button is armed again for a fresh package
+					mouldToken = '';
+					downloadUrl = '';
+					zipDownloaded = false;
+				}
 				throw new Error(msg);
 			}
 			const blob = await res.blob();
-			if (!blob || blob.size === 0) throw new Error('The download came back empty. Please generate the mould again.');
+			if (!blob || blob.size === 0) {
+				mouldToken = '';
+				downloadUrl = '';
+				throw new Error('The download came back empty. Please generate the mould again.');
+			}
 			const url = URL.createObjectURL(blob);
 			const a = document.createElement('a');
 			a.href = url;
 			a.rel = 'noopener';
-			const base = file && file.name ? file.name.replace(/\.[^.]+$/, '') : 'navi3d';
+			const raw = file && file.name ? file.name.replace(/\.[^.]+$/, '') : 'model';
+			const base = (raw || 'model').replace(/[^\w.-]+/g, '_'); // safe filename
 			a.download = `${base}_mould.zip`;
 			document.body.appendChild(a);
 			a.click();
@@ -1077,6 +1094,9 @@
 					{/if}
 
 					<button class="cta light" type="button" disabled={zipDownloaded || downloading} onclick={downloadZip}>{downloading ? 'Preparing ZIP…' : zipDownloaded ? 'Downloaded ✓' : 'Download mould (ZIP)'}</button>
+					{#if errorMsg && !downloading && !zipDownloaded}
+						<div class="alert err-a" style="margin-top:10px;"><strong>Download problem</strong><p>{errorMsg}{#if !mouldToken && !downloadUrl} Press <em>Generate mould</em> again to make a fresh package.{/if}</p></div>
+					{/if}
 					<p class="note">{zipDownloaded ? 'Saved to your device — the package is removed from the server once delivered.' : downloading ? 'Fetching the package…' : `The ZIP contains the ${report.mould_style === 'silicone_box' ? 'box STL' : 'mould STL'}${report.pieces > 1 ? 's' : ''} and report.json. It can be downloaded once.`}</p>
 				</section>
 			{/if}
