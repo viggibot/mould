@@ -38,6 +38,7 @@
 					<h4>Legal</h4>
 					<a href="/terms">Terms of Service</a>
 					<a href="/privacy">Privacy Policy</a>
+					<a href="/refunds">Refund Policy</a>
 				</div>
 			</nav>
 		</div>
