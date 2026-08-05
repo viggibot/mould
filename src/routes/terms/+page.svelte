@@ -2,12 +2,16 @@
 	import { site } from '$lib/content.js';
 	import LegalShell from '$lib/components/LegalShell.svelte';
 
-	const updated = '31 July 2026';
+	const updated = '5 August 2026';
 
 	const toc = [
 		{ id: 'agreement', label: 'The agreement' },
 		{ id: 'service', label: 'The service' },
 		{ id: 'accounts', label: 'Accounts' },
+		{ id: 'plans', label: 'Plans & pricing' },
+		{ id: 'payments', label: 'Payments' },
+		{ id: 'subscriptions', label: 'Renewal & cancellation' },
+		{ id: 'refunds', label: 'Refunds' },
 		{ id: 'your-content', label: 'Your files & content' },
 		{ id: 'acceptable-use', label: 'Acceptable use' },
 		{ id: 'manufacturing', label: 'Printing by Navi3D' },
@@ -23,7 +27,7 @@
 
 <svelte:head>
 	<title>Terms of Service — {site.name}</title>
-	<meta name="description" content={`The terms that govern your use of ${site.name}, a free browser-based mould generator.`} />
+	<meta name="description" content={`The terms that govern your use of ${site.name}, a browser-based mould generator with free and paid plans.`} />
 	<link rel="canonical" href="https://akritio.com/terms" />
 </svelte:head>
 
@@ -41,23 +45,118 @@
 	<section id="service">
 		<h2>The service</h2>
 		<p>
-			{site.name} is a free, browser-based tool that turns 3D models you provide into print-ready
-			mould geometry for casting in silicone, resin and concrete. Generation runs on our servers;
-			you upload a model and we return mould files.
+			{site.name} is a browser-based tool that turns 3D models you provide into print-ready mould
+			geometry for casting in silicone, resin and concrete. Generation runs on our servers; you
+			upload a model and we return mould files.
 		</p>
 		<p>
-			The Service is provided on an ongoing “as available” basis. We may add, change, or remove
-			features, limits, or availability at any time.
+			The Service is offered on both a <b>free plan</b> and <b>paid subscription plans</b> (see
+			<a href="/pricing">Pricing</a>). It is provided on an ongoing “as available” basis, and we may
+			add, change, or remove features, limits, plans, or availability at any time.
 		</p>
 	</section>
 
 	<section id="accounts">
 		<h2>Accounts</h2>
 		<p>
-			Some features may require an account, which you can create directly or through Google or
-			GitHub sign-in. You’re responsible for activity under your account and for keeping your
-			credentials secure. You must provide accurate information and be old enough to form a binding
-			contract in your jurisdiction.
+			Some features — including any paid plan — require an account, which you can create directly or
+			through Google or GitHub sign-in. You’re responsible for activity under your account and for
+			keeping your credentials secure. You must provide accurate information and be old enough to
+			form a binding contract in your jurisdiction.
+		</p>
+	</section>
+
+	<section id="plans">
+		<h2>Plans & pricing</h2>
+		<p>
+			We offer a free plan and one or more paid plans. Current plans, features and prices are shown
+			on our <a href="/pricing">Pricing</a> page and form part of these Terms when you subscribe.
+		</p>
+		<ul>
+			<li>
+				<b>Currency & region.</b> Prices are shown in Indian Rupees (₹) for customers in India and
+				in US Dollars ($) for customers elsewhere, based on your region. Each currency has its own
+				price — it is not a live conversion of the other.
+			</li>
+			<li>
+				<b>Taxes.</b> Prices for customers in India are <span class="mark">inclusive of GST</span>
+				unless stated otherwise. For customers outside India, prices are exclusive of any local
+				taxes, duties, or charges that may apply in your country, which are your responsibility.
+			</li>
+			<li>
+				<b>Price changes.</b> We may change plan prices. Any change to the price of a plan you’re
+				already subscribed to takes effect only from your next renewal, and we’ll give you
+				reasonable notice beforehand.
+			</li>
+		</ul>
+	</section>
+
+	<section id="payments">
+		<h2>Payments</h2>
+		<p>
+			Paid plans are billed through our payment processor,
+			<b>Razorpay</b> [Razorpay Software Private Limited]. When you pay, you also agree to the
+			processor’s own terms, and you confirm you’re authorised to use the payment method.
+		</p>
+		<ul>
+			<li>
+				<b>Accepted methods.</b> In India, you can pay by UPI, cards, net-banking, wallets or EMI.
+				For international payments, we accept international credit and debit cards, which are
+				verified with 3-D Secure.
+			</li>
+			<li>
+				<b>Card & payment data.</b> Your card, UPI, and bank details are entered with and handled
+				directly by Razorpay. <span class="mark">We never receive or store your full payment
+				details</span> on our servers.
+			</li>
+			<li>
+				<b>Invoices.</b> We issue an invoice for each successful payment to your account email.
+			</li>
+		</ul>
+		<div class="note">
+			International card payments require the card to support cross-border transactions and 3-D
+			Secure. Some banks decline these by default — that’s a decision made by your bank, not by us.
+		</div>
+	</section>
+
+	<section id="subscriptions">
+		<h2>Renewal & cancellation</h2>
+		<p>
+			Paid plans are subscriptions billed on a recurring <b>monthly</b> cycle. Your subscription
+			<span class="mark">renews automatically</span> at the then-current price each month until you
+			cancel.
+		</p>
+		<ul>
+			<li>
+				<b>Cancelling.</b> You can cancel any time from your account dashboard, or by contacting us.
+				Cancellation stops future renewals; your paid access continues until the end of the period
+				you’ve already paid for.
+			</li>
+			<li>
+				<b>Failed payments.</b> If a renewal payment fails, we may retry it and, if it keeps
+				failing, suspend or downgrade the paid features until payment succeeds.
+			</li>
+		</ul>
+		<div class="note">
+			By subscribing to a paid plan you authorise us and our payment processor to charge the
+			applicable fee to your chosen payment method on each monthly renewal, until you cancel.
+			Recurring authorisations are handled by the payment processor in line with applicable
+			regulations.
+		</div>
+	</section>
+
+	<section id="refunds">
+		<h2>Refunds</h2>
+		<p>
+			Except where required by law, subscription fees are <b>non-refundable</b>, and we don’t provide
+			refunds or credits for partial billing periods or unused time. Cancelling stops future charges
+			but doesn’t refund the current period. [Optional: state any goodwill/refund window here, e.g.
+			“We’ll refund a charge if you cancel within 7 days of your first payment and haven’t exported a
+			paid mould.”]
+		</p>
+		<p>
+			If you were charged in error or believe there’s a billing problem, contact us at
+			<a href="mailto:hello@akritio.com">hello@akritio.com</a> and we’ll look into it.
 		</p>
 	</section>
 
@@ -82,6 +181,7 @@
 			<li>Use the Service to create parts intended to cause harm, or anything unlawful.</li>
 			<li>Attempt to disrupt, overload, reverse-engineer, or gain unauthorised access to the Service or its infrastructure.</li>
 			<li>Abuse, scrape, or resell the Service or its output in violation of these Terms.</li>
+			<li>Use a payment method you’re not authorised to use, or attempt fraudulent or abusive transactions.</li>
 		</ul>
 	</section>
 
@@ -121,8 +221,9 @@
 		<p>
 			To the maximum extent permitted by law, we’re not liable for any indirect, incidental, or
 			consequential damages, or for lost profits, data, or materials, arising from your use of the
-			Service. Because the Service is free, our total liability to you is limited to [₹ nominal
-			amount, e.g. ₹1,000] or the amount you paid us in the last 12 months, whichever is greater.
+			Service. Our total liability to you for any claim is limited to the greater of [₹ nominal
+			amount, e.g. ₹5,000] or the total amount you paid us for the Service in the 12 months before
+			the event giving rise to the claim.
 		</p>
 	</section>
 
@@ -138,8 +239,10 @@
 	<section id="termination">
 		<h2>Termination</h2>
 		<p>
-			You can stop using the Service any time. We may suspend or end access if you breach these
-			Terms or misuse the Service. Sections that by their nature should survive (ownership, warranty
+			You can stop using the Service any time, and cancel a paid plan as described under
+			<a href="#subscriptions">Renewal & cancellation</a>. We may suspend or end access — including
+			paid features for non-payment — if you breach these Terms or misuse the Service. Sections that
+			by their nature should survive (ownership, payment obligations already incurred, warranty
 			disclaimers, liability limits, governing law) continue after termination.
 		</p>
 	</section>
