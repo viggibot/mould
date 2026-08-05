@@ -11,7 +11,7 @@
 	const symbols = { INR: '₹', USD: '$' };
 
 	// Rust backend base URL. Change to your API origin (or import from $env/static/public).
-	const API_BASE = 'https://api.akritio.com';
+	const API_BASE = 'https://api.navi3d.in';
 
 	// Display prices only. The server (akritio_create_order) owns the real amounts.
 	const plans = [
