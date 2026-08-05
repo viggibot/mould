@@ -562,6 +562,7 @@
 				<circle cx="15" cy="14" r="2.4" fill="#22d3ee" />
 			</svg>
 			<span>Mould<b>Studio</b></span>
+			<span style="margin-left:8px;font-size:10px;font-weight:700;color:#7c3aed;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:999px;padding:2px 7px;">core build</span>
 		</a>
 
 		<div class="bar-file">
