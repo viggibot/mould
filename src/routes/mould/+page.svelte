@@ -47,6 +47,7 @@
 		master_seat: true,
 		master_clearance_mm: 0.3,
 		base_flange_mm: 8,
+		silicone_type: 'box',
 
 		resolution: 'standard',
 		voxel_size_mm: 0.5,
@@ -339,6 +340,7 @@
 		c.master_seat = !!c.master_seat;
 		c.master_clearance_mm = clamp(n(c.master_clearance_mm, 0.3), 0, 2);
 		c.base_flange_mm = clamp(n(c.base_flange_mm, 8), 0, 30);
+		if (c.silicone_type !== 'core') c.silicone_type = 'box';
 		if (c.mould_style === 'silicone_box') {
 			// silicone builds a split box (two-part) or an open tray (one-part)
 			if (c.mould_type !== 'two_part' && c.mould_type !== 'one_part') c.mould_type = 'two_part';
@@ -658,6 +660,17 @@
 						</div>
 						<p class="hint">{#if isSilicone}A rigid mother-mould that FOLLOWS your part on a base plate. Pour silicone into the gap around the master, cure, release the silicone negative, then cast plaster/resin in it. Set the gap and base in the Box tab.{:else}A solid rectangular mould split into parts. Simple and strong; best when you don't need to save material.{/if}</p>
 					</div>
+
+					{#if isSilicone}
+						<div class="field">
+							<span class="lbl">Silicone type</span>
+							<div class="segs">
+								<button type="button" class="seg {params.silicone_type !== 'core' ? 'on' : ''}" onclick={() => (params.silicone_type = 'box')}>Solid / relief</button>
+								<button type="button" class="seg {params.silicone_type === 'core' ? 'on' : ''}" onclick={() => (params.silicone_type = 'core')}>Inner-core</button>
+							</div>
+							<p class="hint">{#if params.silicone_type === 'core'}For <strong>hollow or tubular parts</strong> — rings, tubes, cups, vases. As well as the outer jacket, an <strong>inner core</strong> (<code>silicone_core.stl</code>) is generated that plugs the part's bore/cavity, so silicone forms the inner wall instead of filling it solid. Seat the core before pouring, then pull it out by its top handle after curing.{:else}For <strong>solid models and reliefs</strong>. The jacket wraps the outside only. Switch to Inner-core if your part has a through-hole or an open cavity.{/if}</p>
+						</div>
+					{/if}
 
 					<div class="field">
 						<span class="lbl">{isSilicone ? 'Split axis' : 'Pull axis'}</span>
@@ -1015,7 +1028,7 @@
 				<h3>Summary</h3>
 				<div class="rows">
 					<div class="row"><span>Model</span><span class="v">{file ? file.name : '—'}</span></div>
-					<div class="row"><span>Type</span><span class="v">{typeLabel} · {isSilicone ? (isTwoPart ? 'split silicone' : 'silicone tray') : 'block'}</span></div>
+					<div class="row"><span>Type</span><span class="v">{typeLabel} · {isSilicone ? (isTwoPart ? 'split silicone' : 'silicone tray') : 'block'}{isSilicone && params.silicone_type === 'core' ? ' + core' : ''}</span></div>
 					<div class="row"><span>Pull / parting</span><span class="v">{#if isRadial}{isSixPart ? '4 radial + 2 caps' : 'radial ±X ±Y'}{:else}{params.parting_axis.toUpperCase()}{#if isTwoPart} · {params.parting_mode}{isConformal ? ' · flange' : params.parting_surface === 'follow' ? ' · silhouette' : ''}{/if}{/if}</span></div>
 					{#if isSilicone}
 						<div class="row"><span>Silicone gap</span><span class="v">{params.silicone_gap_mm} mm</span></div>
