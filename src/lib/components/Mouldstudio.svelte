@@ -2,12 +2,7 @@
 	// ==========================================================================
 	// MOULD STUDIO — a full-screen design studio for the mould generator.
 	// Centre viewport shows a live preview that updates as settings change.
-	//
-	// Now a CHILD of Studio.svelte: the uploaded model (file + buffer) is owned
-	// by the shell and passed in as props, so it is shared with the STL editor.
-	// Uploading/removing here reports back through onShared(); the header mode
-	// switch flips to the editor through onSwitch(). All mould logic below is
-	// unchanged.
+	// No accounts, no payments, no quotas — every option is available.
 	//
 	// Param names match the backend MouldParams serde contract exactly
 	// (snake_case, `mould_type` / `mould_style`). Do not rename them.
@@ -15,21 +10,16 @@
 	import { PUBLIC_API_BASE_URL } from '$env/static/public';
 	import MouldPreview from '$lib/components/MouldPreview.svelte';
 
-	// ---- shared model (owned by the Studio shell) ---------------------------
-	// `active` is true only while this tool is the visible mode. The 3D preview
-	// is mounted only when active, so it re-initialises and repaints correctly
-	// every time you switch back to the mould tab.
-	let { file = null, modelBuffer = null, active = true, onShared = () => {}, onSwitch = () => {} } = $props();
-
 	const API = PUBLIC_API_BASE_URL;
 	const MAX_UPLOAD_MB = 200;
 	const ACCEPT = ['.stl', '.step', '.stp', '.3mf'];
 
-	// ---- local UI state -----------------------------------------------------
+	// ---- file state ---------------------------------------------------------
+	let file = $state(null);
+	let modelBuffer = $state(null);
 	let fileError = $state('');
 	let dragOver = $state(false);
 	let fileInputEl;
-	let isStl = $derived(!!file && file.name.toLowerCase().endsWith('.stl'));
 
 	// ---- params (names MUST match backend MouldParams serde) ----------------
 	let params = $state({
@@ -173,6 +163,38 @@
 			: seg.mould_type
 	);
 	let showOffset = $derived(params.parting_mode === 'offset');
+
+	// --- Card-style mould-type picker: each card sets the real backend params
+	// (style + silicone_type + mould_type) so users pick a use-case, not knobs.
+	const MOULD_CARDS = [
+		{ id: 'box', title: 'Two-part box', tags: ['Candles', 'Soap', 'Wax'], style: 'block', stype: 'box', mtype: 'two_part',
+		  hint: 'A solid rigid block split into two halves. Cast plaster, wax or soap directly into it — no silicone needed.',
+		  svg: '<rect x="4" y="7" width="9" height="20" rx="1.5"/><rect x="19" y="7" width="9" height="20" rx="1.5"/>' },
+		{ id: 'adaptive', title: 'Adaptive silicone', tags: ['Figures', 'Resin', 'Detail'], style: 'silicone_box', stype: 'box', mtype: 'two_part',
+		  hint: 'A rigid two-part jacket that follows the part. Pour silicone into the gap, cure, open it and peel off a reusable silicone negative — then cast resin/plaster in that.',
+		  svg: '<path d="M16 5 C9 5 6 10 6 16 C6 23 10 27 16 27" fill="none" stroke-width="2.4"/><path d="M16 5 C23 5 26 10 26 16 C26 23 22 27 16 27" fill="none" stroke-width="2.4"/>' },
+		{ id: 'reusable', title: 'Reusable silicone', tags: ['Reliefs', 'Coins', 'Soap'], style: 'silicone_box', stype: 'box', mtype: 'one_part',
+		  hint: 'A one-part open tray the master nests into. Pour silicone over the top, cure, then flex the reusable mould off — ideal for coins, tiles and flat reliefs.',
+		  svg: '<path d="M5 12 h22 v11 a2 2 0 0 1 -2 2 h-18 a2 2 0 0 1 -2 -2 z" fill="none" stroke-width="2.2"/><ellipse cx="16" cy="12" rx="11" ry="3"/>' },
+		{ id: 'vase', title: 'Vase & planter', tags: ['Planters', 'Pots', 'Rings'], style: 'silicone_box', stype: 'core', mtype: 'two_part',
+		  hint: 'For hollow / tubular parts. A two-part jacket PLUS an inner core (with a pull-wheel) that plugs the bore, so silicone forms the inside wall instead of filling it solid.',
+		  svg: '<path d="M8 8 v14 a8 8 0 0 0 16 0 v-14" fill="none" stroke-width="2.2"/><ellipse cx="16" cy="8" rx="8" ry="2.6"/><circle cx="16" cy="15" r="4.5" fill="none" stroke-width="2"/>' }
+	];
+	function selectMouldCard(c) {
+		params.mould_style = c.style;
+		params.silicone_type = c.stype;
+		params.mould_type = c.mtype;
+	}
+	let activeCard = $derived(
+		params.mould_style === 'silicone_box'
+			? params.silicone_type === 'core'
+				? 'vase'
+				: params.mould_type === 'one_part'
+					? 'reusable'
+					: 'adaptive'
+			: (params.mould_type === 'two_part' ? 'box' : 'block-adv')
+	);
+
 	let showCustomVoxel = $derived(params.resolution === 'custom');
 	let showSprue = $derived(params.gate_type !== 'none' && !isOnePart);
 	let showFunnel = $derived(params.sprue_type === 'funnel' && showSprue);
@@ -237,16 +259,6 @@
 	let elapsed = $state(0);
 	let elapsedTimer = null;
 
-	// A new/replaced shared model (e.g. the STL editor sent an edited part)
-	// invalidates any previous result. Reset when the file identity changes.
-	let _lastFile = null;
-	$effect(() => {
-		if (file !== _lastFile) {
-			_lastFile = file;
-			resetResult();
-		}
-	});
-
 	// ---- helpers ------------------------------------------------------------
 	function fmtSize(bytes) {
 		if (bytes < 1024) return bytes + ' B';
@@ -273,10 +285,12 @@
 			fileError = `That file is ${fmtSize(f.size)}. The limit is ${MAX_UPLOAD_MB} MB.`;
 			return;
 		}
-		// hand the model to the shell (file first, buffer once read)
-		onShared(f, null);
+		file = f;
+		modelBuffer = null;
 		f.arrayBuffer()
-			.then((b) => onShared(f, b))
+			.then((b) => {
+				if (file === f) modelBuffer = b;
+			})
 			.catch(() => {});
 		resetResult();
 	}
@@ -291,7 +305,8 @@
 		errorMsg = '';
 	}
 	function clearFile() {
-		onShared(null, null);
+		file = null;
+		modelBuffer = null;
 		fileError = '';
 		resetResult();
 	}
@@ -579,20 +594,12 @@
 				<circle cx="15" cy="14" r="2.4" fill="#22d3ee" />
 			</svg>
 			<span>Mould<b>Studio</b></span>
+			<span style="margin-left:8px;font-size:10px;font-weight:700;color:#7c3aed;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:999px;padding:2px 7px;">core build</span>
 		</a>
-
-		<!-- MODE SWITCH: shared with the STL editor -->
-		<div class="mode" role="tablist" aria-label="Studio mode">
-			<button type="button" class="mode-b" role="tab" onclick={() => onSwitch('edit')} title="Resize, extrude, cut, or add text to the model first">Edit STL</button>
-			<button type="button" class="mode-b on" role="tab" aria-current="true">Generate Mould</button>
-		</div>
 
 		<div class="bar-file">
 			{#if file}
 				<span class="fchip"><span class="fname">{file.name}</span><span class="fsize">{fmtSize(file.size)}</span></span>
-				{#if isStl}
-					<button class="mini" type="button" onclick={() => onSwitch('edit')} title="Open this model in the STL editor">Edit</button>
-				{/if}
 				<button class="mini" type="button" onclick={clearFile}>Remove</button>
 			{:else}
 				<button class="mini solid" type="button" onclick={() => fileInputEl.click()}>Upload model</button>
@@ -645,9 +652,6 @@
 							</div>
 							<button class="ghost" type="button" onclick={clearFile}>Remove</button>
 						</div>
-						{#if isStl}
-							<button class="ghost" type="button" style="margin-top:10px;width:100%;" onclick={() => onSwitch('edit')}>Edit this model in the STL editor →</button>
-						{/if}
 					{/if}
 					{#if fileError}<p class="err">{fileError}</p>{/if}
 					<p class="hint">The mesh should be watertight so the tool can define an inside to hollow out.</p>
@@ -661,13 +665,29 @@
 
 					<div class="field">
 						<span class="lbl">Mould type</span>
-						<div class="segs">
-							{#each mouldTypeOptions as o}
-								<button type="button" class="seg {params.mould_type === o.v ? 'on' : ''}" onclick={() => (params.mould_type = o.v)}>{o.l}</button>
+						<div class="mcards">
+							{#each MOULD_CARDS as c}
+								<button type="button" class="mcard {activeCard === c.id ? 'on' : ''}" onclick={() => selectMouldCard(c)}>
+									<svg class="mcard-ic" viewBox="0 0 32 32" aria-hidden="true">{@html c.svg}</svg>
+									<span class="mcard-ti">{c.title}</span>
+									<span class="mcard-tags">{#each c.tags as t}<em>{t}</em>{/each}</span>
+								</button>
 							{/each}
 						</div>
-						<p class="hint">{#if isSilicone}<strong>Split</strong> is a two-part clamshell you open to release the cured silicone and master. <strong>Tray</strong> is a one-part open box the master nests in — pour, cure, then flex it out.{:else}Two-part splits on a plane. Four-part adds sideways wedges for side undercuts; six-part adds top and bottom caps. Open pour is a single open-top block.{/if}</p>
+						<p class="hint">{MOULD_CARDS.find((c) => c.id === activeCard)?.hint || 'A solid block mould split into multiple pieces for parts with side undercuts.'}</p>
 					</div>
+
+					{#if !isSilicone}
+						<div class="field">
+							<span class="lbl">Block pieces</span>
+							<div class="segs">
+								{#each seg.mould_type as o}
+									<button type="button" class="seg {params.mould_type === o.v ? 'on' : ''}" onclick={() => (params.mould_type = o.v)}>{o.l}</button>
+								{/each}
+							</div>
+							<p class="hint">Two-part splits on a plane. Four-part adds sideways wedges for side undercuts; six-part adds top and bottom caps. Open pour is a single open-top block.</p>
+						</div>
+					{/if}
 
 					{#if isRadial}
 						<div class="field">
@@ -677,27 +697,6 @@
 									<button type="button" class="seg {params.radial_orientation === o.v ? 'on' : ''}" onclick={() => (params.radial_orientation = o.v)}>{o.l}</button>
 								{/each}
 							</div>
-						</div>
-					{/if}
-
-					<div class="field">
-						<span class="lbl">Style</span>
-						<div class="segs">
-							{#each seg.mould_style as o}
-								<button type="button" class="seg {params.mould_style === o.v ? 'on' : ''}" onclick={() => (params.mould_style = o.v)}>{o.l}</button>
-							{/each}
-						</div>
-						<p class="hint">{#if isSilicone}A rigid mother-mould that FOLLOWS your part on a base plate. Pour silicone into the gap around the master, cure, release the silicone negative, then cast plaster/resin in it. Set the gap and base in the Box tab.{:else}A solid rectangular mould split into parts. Simple and strong; best when you don't need to save material.{/if}</p>
-					</div>
-
-					{#if isSilicone}
-						<div class="field">
-							<span class="lbl">Silicone type</span>
-							<div class="segs">
-								<button type="button" class="seg {params.silicone_type !== 'core' ? 'on' : ''}" onclick={() => (params.silicone_type = 'box')}>Solid / relief</button>
-								<button type="button" class="seg {params.silicone_type === 'core' ? 'on' : ''}" onclick={() => (params.silicone_type = 'core')}>Inner-core</button>
-							</div>
-							<p class="hint">{#if params.silicone_type === 'core'}For <strong>hollow or tubular parts</strong> — rings, tubes, cups, vases. As well as the outer jacket, an <strong>inner core</strong> (<code>silicone_core.stl</code>) is generated that plugs the part's bore/cavity, so silicone forms the inner wall instead of filling it solid. Seat the core before pouring, then pull it out by its top handle after curing.{:else}For <strong>solid models and reliefs</strong>. The jacket wraps the outside only. Switch to Inner-core if your part has a through-hole or an open cavity.{/if}</p>
 						</div>
 					{/if}
 
@@ -1024,7 +1023,7 @@
 	<!-- ===================== CENTRE: VIEWPORT ===================== -->
 	<main class="viewport">
 		{#if file && modelBuffer}
-			{#if active}<MouldPreview {modelBuffer} fileName={file.name} {params} />{/if}
+			<MouldPreview {modelBuffer} fileName={file.name} {params} />
 		{:else if file}
 			<div class="vp-empty"><div class="spinner"></div><p>Reading {file.name}…</p></div>
 		{:else}
@@ -1199,36 +1198,6 @@
 		font-weight: 500;
 		color: var(--muted);
 	}
-
-	/* studio mode switch (shared with the STL editor) */
-	.mode {
-		display: inline-flex;
-		gap: 2px;
-		background: var(--soft);
-		border: 1px solid var(--line);
-		border-radius: 999px;
-		padding: 3px;
-	}
-	.mode-b {
-		font-family: inherit;
-		font-size: 12px;
-		font-weight: 600;
-		color: var(--muted);
-		background: transparent;
-		border: none;
-		border-radius: 999px;
-		padding: 6px 13px;
-		cursor: pointer;
-		transition: color 0.15s, background 0.15s;
-	}
-	.mode-b:hover {
-		color: var(--ink);
-	}
-	.mode-b.on {
-		background: var(--ink);
-		color: #fff;
-	}
-
 	.bar-file {
 		display: flex;
 		align-items: center;
@@ -1488,6 +1457,70 @@
 		background: var(--blue);
 		border-color: var(--blue);
 		color: #fff;
+	}
+
+	/* card-style mould type picker */
+	.mcards {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 9px;
+	}
+	.mcard {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 5px;
+		border: 1.5px solid var(--line);
+		background: #fff;
+		border-radius: 12px;
+		padding: 11px 12px 10px;
+		cursor: pointer;
+		text-align: left;
+		transition: border-color 0.14s, box-shadow 0.14s, background 0.14s;
+		font-family: inherit;
+	}
+	.mcard:hover {
+		border-color: #c7d2fe;
+		box-shadow: 0 2px 10px rgba(59, 130, 246, 0.08);
+	}
+	.mcard.on {
+		border-color: var(--blue);
+		background: #f5f8ff;
+		box-shadow: 0 2px 12px rgba(59, 130, 246, 0.14);
+	}
+	.mcard-ic {
+		width: 26px;
+		height: 26px;
+		stroke: #64748b;
+		fill: #64748b;
+	}
+	.mcard.on .mcard-ic {
+		stroke: var(--blue);
+		fill: var(--blue);
+	}
+	.mcard-ti {
+		font-size: 13px;
+		font-weight: 650;
+		color: var(--ink);
+		line-height: 1.15;
+	}
+	.mcard-tags {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+	}
+	.mcard-tags em {
+		font-style: normal;
+		font-size: 9.5px;
+		font-weight: 600;
+		color: #94a3b8;
+		background: #f1f5f9;
+		border-radius: 5px;
+		padding: 1px 5px;
+	}
+	.mcard.on .mcard-tags em {
+		color: #6366f1;
+		background: #eef2ff;
 	}
 
 	.g2 {
