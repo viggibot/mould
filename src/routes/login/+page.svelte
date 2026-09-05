@@ -1,9 +1,21 @@
 <script>
+	import { onMount } from 'svelte';
 	import { site } from '$lib/content.js';
-	// import { goto } from '$app/navigation'; // uncomment when wiring API redirect
+	import { PUBLIC_API_BASE_URL, PUBLIC_GOOGLE_CLIENT_ID } from '$env/static/public';
+
+	// ---------- API Configuration ----------
+	const API = PUBLIC_API_BASE_URL;
+	const CLIENT_ID = 'akritio'; // maps to backend source "akritio"
+	// Must match GOOGLE_CLIENT_ID_AKRITIO on the backend.
+	const GOOGLE_CLIENT_ID = PUBLIC_GOOGLE_CLIENT_ID || '';
+	// Where to land after a successful auth (the generator).
+	const POST_AUTH_REDIRECT = '/mould';
+	// Must be in the backend's is_valid_redirect_uri() allow-list for "akritio".
+	const REDIRECT_URI =
+		typeof window !== 'undefined' ? `${window.location.origin}/login` : 'https://akritio.com/login';
 
 	// ---------- Step machine ----------
-	let step = $state('login'); // 'login' | 'forgot_init' | 'forgot_reset'
+	let step = $state('login'); // 'login' | 'forgot_init' | 'forgot_reset' | 'callback'
 
 	// ---------- Form state ----------
 	let email = $state('');
@@ -25,11 +37,25 @@
 		showPw = false;
 	}
 
-	// ============================================================
-	// UI ONLY — no API wired. Replace each TODO with a real call.
-	// ============================================================
+	// ---------- PKCE helpers ----------
+	function dec2hex(dec) {
+		return ('0' + dec.toString(16)).substr(-2);
+	}
+	function generateRandomString(length) {
+		const array = new Uint32Array(length / 2);
+		window.crypto.getRandomValues(array);
+		return Array.from(array, dec2hex).join('');
+	}
+	async function generateCodeChallenge(verifier) {
+		const data = new TextEncoder().encode(verifier);
+		const digest = await window.crypto.subtle.digest('SHA-256', data);
+		return btoa(String.fromCharCode(...new Uint8Array(digest)))
+			.replace(/\+/g, '-')
+			.replace(/\//g, '_')
+			.replace(/=+$/, '');
+	}
 
-	// 1. Standard login
+	// 1. Standard login (PKCE flow initiation)
 	async function handleLogin(e) {
 		e?.preventDefault();
 		error = '';
@@ -39,10 +65,35 @@
 			return;
 		}
 		loading = true;
-		// TODO: POST to your auth API. On success -> goto('/mould').
-		await new Promise((r) => setTimeout(r, 700)); // simulated latency
-		loading = false;
-		error = 'Auth API not connected yet — this is the UI only.';
+		try {
+			const codeVerifier = generateRandomString(64);
+			const state = generateRandomString(32);
+			const codeChallenge = await generateCodeChallenge(codeVerifier);
+
+			sessionStorage.setItem('pkce_verifier', codeVerifier);
+			sessionStorage.setItem('oauth_state', state);
+
+			const res = await fetch(`${API}/login`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					email,
+					password,
+					client_id: CLIENT_ID,
+					redirect_uri: REDIRECT_URI,
+					state,
+					code_challenge: codeChallenge
+				})
+			});
+
+			if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Invalid credentials');
+
+			const data = await res.json();
+			if (data.redirect_to) window.location.href = data.redirect_to; // → /login?code=...&state=...
+		} catch (err) {
+			error = err.message || 'Failed to connect to the server.';
+			loading = false;
+		}
 	}
 
 	// 2. Forgot password — request a code
@@ -55,11 +106,20 @@
 			return;
 		}
 		loading = true;
-		// TODO: POST /auth/forgot-password { email }
-		await new Promise((r) => setTimeout(r, 600));
-		loading = false;
-		step = 'forgot_reset';
-		successMsg = `If an account exists, a 6-digit code was sent to ${email}.`;
+		try {
+			const res = await fetch(`${API}/auth/forgot-password`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ email, client_id: CLIENT_ID, cf_token: 'DEV_BYPASS' })
+			});
+			if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Failed to request reset.');
+			step = 'forgot_reset';
+			successMsg = `If an account exists, a 6-digit code was sent to ${email}.`;
+		} catch (err) {
+			error = err.message;
+		} finally {
+			loading = false;
+		}
 	}
 
 	// 3. Forgot password — verify code + set new password
@@ -81,19 +141,78 @@
 			return;
 		}
 		loading = true;
-		// TODO: POST /auth/reset-password { email, otp, new_password }
-		await new Promise((r) => setTimeout(r, 700));
-		loading = false;
-		resetFormState();
-		step = 'login';
-		successMsg = 'Password updated. You can now sign in.';
+		try {
+			const res = await fetch(`${API}/auth/reset-password`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					email,
+					otp: otp.toUpperCase(),
+					client_id: CLIENT_ID,
+					new_password: newPassword
+				})
+			});
+			if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Invalid OTP.');
+			resetFormState();
+			step = 'login';
+			successMsg = 'Password updated. You can now sign in.';
+		} catch (err) {
+			error = err.message;
+		} finally {
+			loading = false;
+		}
 	}
 
-	// 4. OAuth
+	// 4. Google (GSI id_token flow)
+	async function handleGoogleLogin(idToken) {
+		error = '';
+		loading = true;
+		try {
+			const res = await fetch(`${API}/login/google`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ id_token: idToken, client_id: CLIENT_ID, role: 'customer' })
+			});
+			if (!res.ok) throw new Error('Google login failed');
+			const data = await res.json();
+			const storage = remember ? localStorage : sessionStorage;
+			storage.setItem('akritio_access_token', data.access_token);
+			storage.setItem('akritio_refresh_token', data.refresh_token);
+			window.location.href = POST_AUTH_REDIRECT;
+		} catch (err) {
+			error = err.message;
+			loading = false;
+		}
+	}
+
+	function triggerGoogleAuth() {
+		error = '';
+		if (typeof window.google === 'undefined' || !window.google.accounts) {
+			error = 'Google Sign-In is still loading or blocked by the browser. Please try again in a moment.';
+			return;
+		}
+		window.google.accounts.id.initialize({
+			client_id: GOOGLE_CLIENT_ID,
+			callback: (response) => {
+				if (response.credential) handleGoogleLogin(response.credential);
+			}
+		});
+		window.google.accounts.id.prompt((notification) => {
+			if (notification.isNotDisplayed() || notification.isSkippedMoment()) {
+				error = 'Google Sign-In popup was blocked or skipped. Please try again.';
+			}
+		});
+	}
+
 	function oauth(provider) {
 		error = '';
-		// TODO: kick off `${provider}` OAuth flow
-		error = `${provider} sign-in isn't wired yet — UI only.`;
+		const p = (provider || '').toLowerCase();
+		if (p === 'google') {
+			triggerGoogleAuth();
+			return;
+		}
+		// The shared auth backend only implements Google right now.
+		error = "GitHub sign-in isn't available yet.";
 	}
 
 	function goForgot() {
@@ -104,17 +223,75 @@
 		step = 'login';
 		resetFormState();
 	}
+
+	// ---------- Lifecycle: PKCE callback + guards ----------
+	onMount(async () => {
+		const url = new URL(window.location.href);
+		const code = url.searchParams.get('code');
+		const state = url.searchParams.get('state');
+
+		// A) Handle the PKCE redirect back from /login
+		if (code && state) {
+			step = 'callback';
+			const savedState = sessionStorage.getItem('oauth_state');
+			const codeVerifier = sessionStorage.getItem('pkce_verifier');
+
+			if (state === savedState && codeVerifier) {
+				try {
+					const res = await fetch(`${API}/token`, {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({
+							grant_type: 'authorization_code',
+							code,
+							redirect_uri: REDIRECT_URI, // must match exactly
+							code_verifier: codeVerifier,
+							client_id: CLIENT_ID
+						})
+					});
+
+					if (res.ok) {
+						const data = await res.json();
+						localStorage.setItem('akritio_access_token', data.access_token);
+						localStorage.setItem('akritio_refresh_token', data.refresh_token);
+						sessionStorage.removeItem('pkce_verifier');
+						sessionStorage.removeItem('oauth_state');
+						window.location.href = POST_AUTH_REDIRECT;
+						return;
+					}
+				} catch (err) {
+					console.error('Token exchange failed', err);
+				}
+			}
+
+			// Verification failed → clean the URL and return to the form.
+			window.history.replaceState({}, document.title, window.location.pathname);
+			step = 'login';
+			error = 'Authentication securely blocked. Please try again.';
+			return;
+		}
+
+		// B) Friendly note right after signup
+		if (url.searchParams.get('registered') === 'true') {
+			successMsg = 'Account created. You can now sign in.';
+		}
+
+		// C) Already signed in → straight to the generator
+		if (localStorage.getItem('akritio_access_token')) {
+			window.location.href = POST_AUTH_REDIRECT;
+		}
+	});
 </script>
 
 <svelte:head>
 	<title>Sign in — {site.name}</title>
 	<meta name="robots" content="noindex" />
+	<script src="https://accounts.google.com/gsi/client" async defer></script>
 </svelte:head>
 
 <div class="auth">
 	<!-- ---------- Brand panel ---------- -->
 	<section class="brandside" aria-hidden="true">
-		<!-- accent dots + sparkles -->
 		<span class="d d1"></span>
 		<span class="d d2"></span>
 		<span class="d d3"></span>
@@ -122,7 +299,6 @@
 		<span class="spark s1">✦</span>
 		<span class="spark s2">✦</span>
 
-		<!-- teal two-part mould -->
 		<svg class="mould" viewBox="0 0 120 90" fill="none" aria-hidden="true">
 			<rect x="6" y="10" width="48" height="70" rx="8" stroke="var(--teal)" stroke-width="4" />
 			<rect x="66" y="10" width="48" height="70" rx="8" stroke="var(--teal)" stroke-width="4" />
@@ -130,7 +306,6 @@
 			<path d="M90 26c-8 0-8 12 0 12s8 14 0 14" stroke="var(--teal)" stroke-width="4" stroke-linecap="round" />
 		</svg>
 
-		<!-- coral gem -->
 		<svg class="gem" viewBox="0 0 80 80" aria-hidden="true">
 			<path d="M20 12h40l16 20-36 40L4 32z" fill="var(--coral)" opacity="0.95" />
 			<path d="M20 12 40 32 60 12M4 32h72M40 32 24 72M40 32l16 40" stroke="#14161f" stroke-width="2" fill="none" opacity="0.25" />
@@ -155,108 +330,116 @@
 		</header>
 
 		<div class="formwrap">
-			<span class="badge"><i class="bdot"></i> Makers’ workshop</span>
-
-			{#if successMsg}
-				<div class="success" role="status">
-					<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
-					<span>{successMsg}</span>
+			{#if step === 'callback'}
+				<div class="callback">
+					<div class="spinner"></div>
+					<h1 class="headline">Signing you in…</h1>
+					<p class="sub">Securing your session.</p>
 				</div>
-			{/if}
+			{:else}
+				<span class="badge"><i class="bdot"></i> Makers’ workshop</span>
 
-			{#if step === 'login'}
-				<h1 class="headline">Let’s get you <mark class="mark">casting.</mark></h1>
-				<p class="sub">Sign in to your {site.name} account to save moulds, track prints, and jump back into the generator.</p>
-
-				<form class="form" onsubmit={handleLogin} novalidate>
-					<label class="field">
-						<span class="lab">Email</span>
-						<input type="email" autocomplete="email" placeholder="you@studio.in" bind:value={email} disabled={loading} />
-					</label>
-
-					<label class="field">
-						<span class="lab">Password</span>
-						<div class="pw">
-							<input type={showPw ? 'text' : 'password'} autocomplete="current-password" placeholder="••••••••" bind:value={password} disabled={loading} />
-							<button type="button" class="ghost" onclick={() => (showPw = !showPw)}>{showPw ? 'Hide' : 'Show'}</button>
-						</div>
-					</label>
-
-					<div class="row">
-						<label class="check"><input type="checkbox" bind:checked={remember} disabled={loading} /><span>Keep me signed in</span></label>
-						<button type="button" class="textlink" onclick={goForgot} disabled={loading}>Forgot password?</button>
+				{#if successMsg}
+					<div class="success" role="status">
+						<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
+						<span>{successMsg}</span>
 					</div>
+				{/if}
 
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
+				{#if step === 'login'}
+					<h1 class="headline">Let’s get you <mark class="mark">casting.</mark></h1>
+					<p class="sub">Sign in to your {site.name} account to save moulds, track prints, and jump back into the generator.</p>
 
-					<button class="submit" type="submit" disabled={loading}>
-						<span>{loading ? 'Signing in…' : 'Sign in'}</span>
-						<svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 12h14M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-					</button>
+					<form class="form" onsubmit={handleLogin} novalidate>
+						<label class="field">
+							<span class="lab">Email</span>
+							<input type="email" autocomplete="email" placeholder="you@studio.in" bind:value={email} disabled={loading} />
+						</label>
 
-					<div class="divider"><span>or continue with</span></div>
+						<label class="field">
+							<span class="lab">Password</span>
+							<div class="pw">
+								<input type={showPw ? 'text' : 'password'} autocomplete="current-password" placeholder="••••••••" bind:value={password} disabled={loading} />
+								<button type="button" class="ghost" onclick={() => (showPw = !showPw)}>{showPw ? 'Hide' : 'Show'}</button>
+							</div>
+						</label>
 
-					<div class="oauths">
-						<button type="button" class="oauth" onclick={() => oauth('Google')} disabled={loading}>
-							<svg viewBox="0 0 24 24" width="18" height="18"><path fill="#EA4335" d="M12 10.2v3.9h5.5c-.24 1.4-1.7 4.1-5.5 4.1A6.2 6.2 0 1 1 16.2 7l2.7-2.6A10 10 0 1 0 22 12c0-.7-.07-1.2-.17-1.8z" /></svg>
-							Google
-						</button>
-						<button type="button" class="oauth" onclick={() => oauth('GitHub')} disabled={loading}>
-							<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.1-1.47-1.1-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.6 9.6 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2z" /></svg>
-							GitHub
-						</button>
-					</div>
-				</form>
-
-				<p class="foot">New to {site.name}? <a class="textlink" href="/signup">Create an account</a></p>
-
-			{:else if step === 'forgot_init'}
-				<h1 class="headline">Reset your <mark class="mark">password.</mark></h1>
-				<p class="sub">Enter your email and we’ll send a 6-digit code to reset your password.</p>
-
-				<form class="form" onsubmit={handleForgotInit} novalidate>
-					<label class="field">
-						<span class="lab">Email</span>
-						<input type="email" autocomplete="email" placeholder="you@studio.in" bind:value={email} disabled={loading} />
-					</label>
-
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
-
-					<button class="submit" type="submit" disabled={loading}>
-						<span>{loading ? 'Sending code…' : 'Send reset code'}</span>
-						<svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 12h14M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-					</button>
-				</form>
-
-				<button type="button" class="backlink" onclick={goLogin} disabled={loading}>← Back to sign in</button>
-
-			{:else if step === 'forgot_reset'}
-				<h1 class="headline">Create a new <mark class="mark">password.</mark></h1>
-				<p class="sub">Enter the code sent to <b>{email}</b> and choose a new password.</p>
-
-				<form class="form" onsubmit={handleForgotReset} novalidate>
-					<label class="field">
-						<span class="lab">Verification code</span>
-						<input class="otp" type="text" autocomplete="one-time-code" placeholder="Enter 6-digit code" bind:value={otp} maxlength="6" disabled={loading} />
-					</label>
-
-					<label class="field">
-						<span class="lab">New password</span>
-						<div class="pw">
-							<input type={showPw ? 'text' : 'password'} autocomplete="new-password" placeholder="At least 8 characters" bind:value={newPassword} disabled={loading} />
-							<button type="button" class="ghost" onclick={() => (showPw = !showPw)}>{showPw ? 'Hide' : 'Show'}</button>
+						<div class="row">
+							<label class="check"><input type="checkbox" bind:checked={remember} disabled={loading} /><span>Keep me signed in</span></label>
+							<button type="button" class="textlink" onclick={goForgot} disabled={loading}>Forgot password?</button>
 						</div>
-					</label>
 
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
+						{#if error}<p class="error" role="alert">{error}</p>{/if}
 
-					<button class="submit" type="submit" disabled={loading}>
-						<span>{loading ? 'Updating…' : 'Update password'}</span>
-						<svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 12h14M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-					</button>
-				</form>
+						<button class="submit" type="submit" disabled={loading}>
+							<span>{loading ? 'Signing in…' : 'Sign in'}</span>
+							<svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 12h14M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+						</button>
 
-				<button type="button" class="backlink" onclick={goLogin} disabled={loading}>← Back to sign in</button>
+						<div class="divider"><span>or continue with</span></div>
+
+						<div class="oauths">
+							<button type="button" class="oauth" onclick={() => oauth('Google')} disabled={loading}>
+								<svg viewBox="0 0 24 24" width="18" height="18"><path fill="#EA4335" d="M12 10.2v3.9h5.5c-.24 1.4-1.7 4.1-5.5 4.1A6.2 6.2 0 1 1 16.2 7l2.7-2.6A10 10 0 1 0 22 12c0-.7-.07-1.2-.17-1.8z" /></svg>
+								Google
+							</button>
+							<button type="button" class="oauth" onclick={() => oauth('GitHub')} disabled={loading}>
+								<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.1-1.47-1.1-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.6 9.6 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2z" /></svg>
+								GitHub
+							</button>
+						</div>
+					</form>
+
+					<p class="foot">New to {site.name}? <a class="textlink" href="/signup">Create an account</a></p>
+
+				{:else if step === 'forgot_init'}
+					<h1 class="headline">Reset your <mark class="mark">password.</mark></h1>
+					<p class="sub">Enter your email and we’ll send a 6-digit code to reset your password.</p>
+
+					<form class="form" onsubmit={handleForgotInit} novalidate>
+						<label class="field">
+							<span class="lab">Email</span>
+							<input type="email" autocomplete="email" placeholder="you@studio.in" bind:value={email} disabled={loading} />
+						</label>
+
+						{#if error}<p class="error" role="alert">{error}</p>{/if}
+
+						<button class="submit" type="submit" disabled={loading}>
+							<span>{loading ? 'Sending code…' : 'Send reset code'}</span>
+							<svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 12h14M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+						</button>
+					</form>
+
+					<button type="button" class="backlink" onclick={goLogin} disabled={loading}>← Back to sign in</button>
+
+				{:else if step === 'forgot_reset'}
+					<h1 class="headline">Create a new <mark class="mark">password.</mark></h1>
+					<p class="sub">Enter the code sent to <b>{email}</b> and choose a new password.</p>
+
+					<form class="form" onsubmit={handleForgotReset} novalidate>
+						<label class="field">
+							<span class="lab">Verification code</span>
+							<input class="otp" type="text" autocomplete="one-time-code" placeholder="Enter 6-digit code" bind:value={otp} maxlength="6" disabled={loading} />
+						</label>
+
+						<label class="field">
+							<span class="lab">New password</span>
+							<div class="pw">
+								<input type={showPw ? 'text' : 'password'} autocomplete="new-password" placeholder="At least 8 characters" bind:value={newPassword} disabled={loading} />
+								<button type="button" class="ghost" onclick={() => (showPw = !showPw)}>{showPw ? 'Hide' : 'Show'}</button>
+							</div>
+						</label>
+
+						{#if error}<p class="error" role="alert">{error}</p>{/if}
+
+						<button class="submit" type="submit" disabled={loading}>
+							<span>{loading ? 'Updating…' : 'Update password'}</span>
+							<svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 12h14M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+						</button>
+					</form>
+
+					<button type="button" class="backlink" onclick={goLogin} disabled={loading}>← Back to sign in</button>
+				{/if}
 			{/if}
 		</div>
 	</section>
@@ -419,6 +602,19 @@
 		margin-bottom: 1rem;
 	}
 	.bdot { width: 7px; height: 7px; border-radius: 50%; background: var(--violet); }
+
+	/* callback (token exchange) */
+	.callback { text-align: center; padding: 3rem 0; }
+	.spinner {
+		width: 40px;
+		height: 40px;
+		border: 4px solid var(--line);
+		border-top-color: var(--violet);
+		border-radius: 50%;
+		margin: 0 auto 1.4rem;
+		animation: spin 1s linear infinite;
+	}
+	@keyframes spin { to { transform: rotate(360deg); } }
 
 	.headline {
 		font-family: var(--fd);
@@ -608,6 +804,6 @@
 		.formwrap { margin: 0 auto; padding: 1.5rem 0 2.5rem; }
 	}
 	@media (prefers-reduced-motion: reduce) {
-		.submit, .submit svg, .home { transition: none; }
+		.submit, .submit svg, .home, .spinner { transition: none; animation: none; }
 	}
 </style>
