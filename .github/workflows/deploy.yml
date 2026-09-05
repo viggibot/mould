@@ -35,6 +35,7 @@ jobs:
           build-args: |
             PUBLIC_API_BASE_URL=${{ vars.PUBLIC_API_BASE_URL }}
             PUBLIC_CLOUDFLARE_KEY=${{ secrets.PUBLIC_CLOUDFLARE_KEY }}
+            PUBLIC_GOOGLE_CLIENT_ID=${{ secrets.PUBLIC_GOOGLE_CLIENT_ID }}
 
   deploy:
     needs: build-and-push-image
