@@ -1,12 +1,22 @@
 <script>
 	// ==========================================================================
-	// MOULD STUDIO — a full-screen design studio for the mould generator.
-	// Centre viewport shows a live preview that updates as settings change.
-	// No accounts, no payments, no quotas — every option is available.
+	// MOULD STUDIO — full-screen design studio for the mould generator.
 	//
-	// Param names match the backend MouldParams serde contract exactly
+	// ACCESS FLOW (added):
+	//   • Generation now REQUIRES login — the request carries the Akritio JWT,
+	//     and the backend rejects anonymous calls (401).
+	//   • Premium options are locked in the UI for free accounts and routed to
+	//     /pricing: silicone mould types, four/six-part, Fine/Custom voxel,
+	//     CAD-exact precision. The backend enforces the same set (402).
+	//   • Free accounts get 1 mould/day; the backend returns 429 and the UI
+	//     shows an upgrade prompt.
+	//   • Subscription status is fetched once on mount from
+	//     GET /akritio/subscription/status.
+	//
+	// Param names still match the backend MouldParams serde contract exactly
 	// (snake_case, `mould_type` / `mould_style`). Do not rename them.
 	// ==========================================================================
+	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$env/static/public';
 	import MouldPreview from '$lib/components/MouldPreview.svelte';
 
@@ -14,12 +24,71 @@
 	const MAX_UPLOAD_MB = 200;
 	const ACCEPT = ['.stl', '.step', '.stp', '.3mf'];
 
-	// ---- file state ---------------------------------------------------------
-	let file = $state(null);
-	let modelBuffer = $state(null);
+	// ---- access / subscription config --------------------------------------
+	const AUTH_TOKEN_KEY = 'akritio_access_token';
+	const LOGIN_PATH = '/login';
+	const PRICING_PATH = '/pricing';
+
+	// ---- shared file state (hosted by the studio shell) --------------------
+	// Works standalone too: local state is the fallback when no shell props
+	// are supplied; setShared() keeps the shell (STL editor) in sync.
+	let {
+		file: fileProp = null,
+		modelBuffer: bufferProp = null,
+		active = true,
+		onShared,
+		onSwitch
+	} = $props();
+
+	let localFile = $state(null);
+	let localBuffer = $state(null);
+	let file = $derived(fileProp ?? localFile);
+	let modelBuffer = $derived(bufferProp ?? localBuffer);
+	function setShared(f, b) {
+		localFile = f;
+		localBuffer = b;
+		onShared?.(f, b);
+	}
+
 	let fileError = $state('');
 	let dragOver = $state(false);
 	let fileInputEl;
+
+	// ---- access state -------------------------------------------------------
+	let loggedIn = $state(false);
+	let isPremium = $state(false);
+	let subChecked = $state(false); // becomes true once status is known
+	let showUpgrade = $state(false); // toggled by 402 / 429 responses
+
+	function getToken() {
+		if (typeof window === 'undefined') return '';
+		return (
+			localStorage.getItem(AUTH_TOKEN_KEY) ||
+			sessionStorage.getItem(AUTH_TOKEN_KEY) ||
+			''
+		);
+	}
+	function authHeaders(extra = {}) {
+		const t = getToken();
+		return t ? { ...extra, Authorization: `Bearer ${t}` } : { ...extra };
+	}
+	function goLogin() {
+		if (typeof window !== 'undefined') window.location.assign(LOGIN_PATH);
+	}
+	function goUpgrade() {
+		if (typeof window !== 'undefined') window.location.assign(PRICING_PATH);
+	}
+
+	// ---- which options are Pro-only (mirrors backend premium_features_used) --
+	const PREMIUM_CARDS = new Set(['adaptive', 'reusable', 'vase']); // 'box' is free
+	const PREMIUM_MOULD_TYPES = new Set(['four_part', 'six_part']);
+	const PREMIUM_RESOLUTIONS = new Set(['fine', 'custom']);
+	const PREMIUM_REFINEMENTS = new Set(['cad_exact']);
+
+	function lockedCard(id) { return subChecked && !isPremium && PREMIUM_CARDS.has(id); }
+	function lockedType(v) { return subChecked && !isPremium && PREMIUM_MOULD_TYPES.has(v); }
+	function lockedRes(v) { return subChecked && !isPremium && PREMIUM_RESOLUTIONS.has(v); }
+	function lockedRefine(v) { return subChecked && !isPremium && PREMIUM_REFINEMENTS.has(v); }
 
 	// ---- params (names MUST match backend MouldParams serde) ----------------
 	let params = $state({
@@ -151,12 +220,9 @@
 	let isRadial = $derived(isFourPart || isSixPart);
 	let isOnePart = $derived(params.mould_type === 'one_part');
 	let isConformal = $derived(false); // Conformal style retired — Block + Silicone only
-	// Silicone mould: a rigid mother-mould the user pours silicone into around a
-	// printed master. Two-part = split clamshell; one-part = open tray.
 	let isSilicone = $derived(params.mould_style === 'silicone_box' && !isRadial);
 	let showPartingSurface = $derived(isTwoPart && !isSilicone);
 	let showFlange = $derived(false);
-	// Silicone offers Split (two-part) and Tray (one-part); block keeps its full set.
 	let mouldTypeOptions = $derived(
 		params.mould_style === 'silicone_box'
 			? [ { v: 'two_part', l: 'Split (2-part)' }, { v: 'one_part', l: 'Tray (1-part)' } ]
@@ -164,8 +230,7 @@
 	);
 	let showOffset = $derived(params.parting_mode === 'offset');
 
-	// --- Card-style mould-type picker: each card sets the real backend params
-	// (style + silicone_type + mould_type) so users pick a use-case, not knobs.
+	// --- Card-style mould-type picker
 	const MOULD_CARDS = [
 		{ id: 'box', title: 'Two-part box', tags: ['Candles', 'Soap', 'Wax'], style: 'block', stype: 'box', mtype: 'two_part',
 		  hint: 'A solid rigid block split into two halves. Cast plaster, wax or soap directly into it — no silicone needed.',
@@ -181,10 +246,16 @@
 		  svg: '<path d="M8 8 v14 a8 8 0 0 0 16 0 v-14" fill="none" stroke-width="2.2"/><ellipse cx="16" cy="8" rx="8" ry="2.6"/><circle cx="16" cy="15" r="4.5" fill="none" stroke-width="2"/>' }
 	];
 	function selectMouldCard(c) {
+		if (lockedCard(c.id)) { goUpgrade(); return; }
 		params.mould_style = c.style;
 		params.silicone_type = c.stype;
 		params.mould_type = c.mtype;
 	}
+	// gated setters for the premium segmented controls
+	function setMouldType(v) { if (lockedType(v)) { goUpgrade(); return; } params.mould_type = v; }
+	function setResolution(v) { if (lockedRes(v)) { goUpgrade(); return; } params.resolution = v; }
+	function setRefinement(v) { if (lockedRefine(v)) { goUpgrade(); return; } params.surface_refinement = v; }
+
 	let activeCard = $derived(
 		params.mould_style === 'silicone_box'
 			? params.silicone_type === 'core'
@@ -226,20 +297,17 @@
 	let tab = $state('model');
 	let visibleTabs = $derived(
 		TABS.filter((t) => {
-			if (t.id === 'box') return isSilicone; // silicone-only settings
+			if (t.id === 'box') return isSilicone;
 			if (isSilicone) {
-				// silicone hides the block/casting tabs (cavity, feed, vents)
 				if (t.id === 'cavity' || t.id === 'feed' || t.id === 'vents') return false;
-				if (t.id === 'keys') return isTwoPart; // split box has flange keys; tray has none
-				return true; // model, mould, box, quality
+				if (t.id === 'keys') return isTwoPart;
+				return true;
 			}
-			// block: hide silicone-only Box; hide feed/vents/keys for a one-part block
 			if ((t.id === 'feed' || t.id === 'vents' || t.id === 'keys') && isOnePart) return false;
 			return true;
 		})
 	);
 	$effect(() => {
-		// Silicone can't be radial (four/six-part) — fall back to a split box.
 		if (params.mould_style === 'silicone_box' && (isFourPart || isSixPart)) {
 			params.mould_type = 'two_part';
 		}
@@ -258,6 +326,22 @@
 	let downloading = $state(false);
 	let elapsed = $state(0);
 	let elapsedTimer = null;
+
+	// ---- lifecycle: know who's signed in + whether they're Pro -------------
+	onMount(async () => {
+		loggedIn = !!getToken();
+		if (!loggedIn) { subChecked = true; return; }
+		try {
+			const res = await fetch(`${API}/akritio/subscription/status`, { headers: authHeaders() });
+			if (res.ok) {
+				const j = await res.json();
+				isPremium = !!(j && j.active);
+			} else if (res.status === 401) {
+				loggedIn = false; // stale token
+			}
+		} catch (_) {}
+		subChecked = true;
+	});
 
 	// ---- helpers ------------------------------------------------------------
 	function fmtSize(bytes) {
@@ -285,12 +369,9 @@
 			fileError = `That file is ${fmtSize(f.size)}. The limit is ${MAX_UPLOAD_MB} MB.`;
 			return;
 		}
-		file = f;
-		modelBuffer = null;
+		setShared(f, null);
 		f.arrayBuffer()
-			.then((b) => {
-				if (file === f) modelBuffer = b;
-			})
+			.then((b) => { if (file === f) setShared(f, b); })
 			.catch(() => {});
 		resetResult();
 	}
@@ -301,12 +382,12 @@
 		downloadUrl = '';
 		zipDownloaded = false;
 		downloading = false;
+		showUpgrade = false;
 		phase = 'idle';
 		errorMsg = '';
 	}
 	function clearFile() {
-		file = null;
-		modelBuffer = null;
+		setShared(null, null);
 		fileError = '';
 		resetResult();
 	}
@@ -364,8 +445,6 @@
 		if (!['standard', 'cad_exact'].includes(c.surface_refinement)) c.surface_refinement = 'standard';
 		if (!['flat', 'follow'].includes(c.parting_surface)) c.parting_surface = 'flat';
 		if (c.mould_type !== 'two_part' && c.parting_surface === 'follow') c.parting_surface = 'flat';
-		// Conformal moulds always split on a flat parting flange — the backend
-		// ignores silhouette-follow for conformal, so send 'flat' to match.
 		if (c.mould_style === 'conformal' && c.parting_surface === 'follow') c.parting_surface = 'flat';
 		c.silicone_gap_mm = clamp(n(c.silicone_gap_mm, 12), 3, 50);
 		c.box_wall_mm = clamp(n(c.box_wall_mm, 3), 1.5, 12);
@@ -374,19 +453,29 @@
 		c.base_flange_mm = clamp(n(c.base_flange_mm, 8), 0, 30);
 		if (c.silicone_type !== 'core') c.silicone_type = 'box';
 		if (c.mould_style === 'silicone_box') {
-			// silicone builds a split box (two-part) or an open tray (one-part)
 			if (c.mould_type !== 'two_part' && c.mould_type !== 'one_part') c.mould_type = 'two_part';
 			c.parting_surface = 'flat';
 		}
-		if (c.mould_style === 'conformal') c.mould_style = 'block'; // conformal retired
+		if (c.mould_style === 'conformal') c.mould_style = 'block';
 		return c;
 	}
 
 	// ---- submit -------------------------------------------------------------
 	async function generate() {
 		if (!canSubmit) return;
+
+		// LOGIN REQUIRED
+		if (!getToken()) {
+			showUpgrade = false;
+			errorMsg = 'Please sign in to generate a mould.';
+			phase = 'error';
+			setTimeout(goLogin, 900);
+			return;
+		}
+
 		phase = 'uploading';
 		errorMsg = '';
+		showUpgrade = false;
 		report = null;
 		mouldToken = '';
 		downloadUrl = '';
@@ -401,8 +490,11 @@
 			fd.append('params', JSON.stringify(clean));
 			fd.append('file', file, file.name);
 
+			// NOTE: do not set Content-Type — the browser adds the multipart
+			// boundary. Only attach the Authorization header.
 			const res = await fetch(`${API}/calc/mould/v2/generate?source=mould_studio`, {
 				method: 'POST',
+				headers: authHeaders(),
 				body: fd
 			});
 
@@ -413,6 +505,34 @@
 				body = JSON.parse(rawText);
 			} catch (e) {
 				/* plain-text error body */
+			}
+
+			// ---- access-control responses ----
+			if (res.status === 401) {
+				loggedIn = false;
+				errorMsg = 'Your session has expired — please sign in again.';
+				phase = 'error';
+				setTimeout(goLogin, 1000);
+				return;
+			}
+			if (res.status === 402) {
+				// PREMIUM_REQUIRED — the body lists the locked options.
+				const locked = (body && body.locked_features) || [];
+				errorMsg = locked.length
+					? `These options need Akritio Pro: ${locked.join(', ')}.`
+					: (body && body.message) || 'That configuration needs Akritio Pro.';
+				showUpgrade = true;
+				phase = 'error';
+				return;
+			}
+			if (res.status === 429) {
+				// DAILY_LIMIT_REACHED
+				errorMsg =
+					(body && body.message) ||
+					'The free plan includes 1 mould per day. Upgrade to Akritio Pro for unlimited moulds.';
+				showUpgrade = true;
+				phase = 'error';
+				return;
 			}
 
 			const okStatus = body && (body.status === 'ok' || body.status === 'success');
@@ -426,6 +546,9 @@
 			mouldToken = body.token || '';
 			downloadUrl = body.download_url || '';
 			phase = 'done';
+
+			// Free accounts just spent today's mould — reflect that in the UI hint.
+			if (!isPremium) freeUsedToday = true;
 		} catch (err) {
 			errorMsg = err && err.message ? err.message : 'The mould could not be generated. Try again.';
 			phase = 'error';
@@ -437,13 +560,10 @@
 		}
 	}
 
-	// Robust download. The old version navigated the top window to the download
-	// URL (window.location.href), which silently failed in several cases
-	// (cross-origin navigation downloads, the page's unload guard, and the
-	// single-use link being marked "downloaded" before the browser committed the
-	// save). Instead we fetch the ZIP as a blob and click a synthetic <a download>
-	// — this reliably saves the file, lets us name it, and surfaces the real
-	// server message (expired / already collected) instead of a blank failure.
+	// tracks that a free account has generated once this session (UI hint only —
+	// the server is the source of truth for the daily quota).
+	let freeUsedToday = $state(false);
+
 	async function downloadZip() {
 		if (zipDownloaded || downloading) return;
 		const target = downloadUrl
@@ -456,11 +576,8 @@
 		downloading = true;
 		errorMsg = '';
 		try {
-			const res = await fetch(target, { method: 'GET' });
+			const res = await fetch(target, { method: 'GET', headers: authHeaders() });
 			const ct = res.headers.get('content-type') || '';
-			// The server returns a JSON error (with a `code`) instead of a ZIP
-			// when the package is gone (DOWNLOAD_EXPIRED) or came back empty
-			// (DOWNLOAD_EMPTY). Surface the message and let the user regenerate.
 			if (!res.ok || ct.includes('application/json') || ct.includes('text/')) {
 				let msg = `Download failed (HTTP ${res.status}).`;
 				let code = '';
@@ -470,8 +587,6 @@
 					code = j.code || '';
 				} catch (_) {}
 				if (code === 'DOWNLOAD_EXPIRED' || code === 'DOWNLOAD_EMPTY') {
-					// the package is no longer downloadable — clear it so the
-					// Generate button is armed again for a fresh package
 					mouldToken = '';
 					downloadUrl = '';
 					zipDownloaded = false;
@@ -489,7 +604,7 @@
 			a.href = url;
 			a.rel = 'noopener';
 			const raw = file && file.name ? file.name.replace(/\.[^.]+$/, '') : 'model';
-			const base = (raw || 'model').replace(/[^\w.-]+/g, '_'); // safe filename
+			const base = (raw || 'model').replace(/[^\w.-]+/g, '_');
 			a.download = `${base}_mould.zip`;
 			document.body.appendChild(a);
 			a.click();
@@ -524,56 +639,46 @@
 </svelte:head>
 
 <!-- ===================== TAB ICONS (second navbar) ===================== -->
-<!-- Small stroke-line marks in the same family as the brand logo, so each
-     section of the properties navbar is recognisable at a glance. -->
 {#snippet tabIcon(id)}
 	{#if id === 'model'}
-		<!-- uploaded 3D part: an isometric cube -->
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<path d="M12 2.5 20.5 7.25 20.5 16.75 12 21.5 3.5 16.75 3.5 7.25Z" />
 			<path d="M12 12V2.5M12 12 3.5 7.25M12 12 20.5 7.25" />
 		</svg>
 	{:else if id === 'mould'}
-		<!-- the two mould halves + parting line — echoes the brand mark -->
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<line x1="12" y1="2.5" x2="12" y2="21.5" stroke-dasharray="2.4 2.4" />
 			<path d="M7.8 18.5A6.5 7.5 0 0 1 7.8 5.5" />
 			<path d="M16.2 5.5A6.5 7.5 0 0 1 16.2 18.5" />
 		</svg>
 	{:else if id === 'box'}
-		<!-- silicone box: an open-top frame with the master seated inside -->
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<path d="M4 6v13a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V6" />
 			<path d="M2.5 6h19" />
 			<rect x="9" y="11" width="6" height="6" rx="1" />
 		</svg>
 	{:else if id === 'cavity'}
-		<!-- hollowed shell: outer block with an inner offset cavity -->
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<rect x="3" y="3" width="18" height="18" rx="4" />
 			<rect x="7.5" y="7.5" width="9" height="9" rx="2.5" />
 		</svg>
 	{:else if id === 'feed'}
-		<!-- feed system: a pouring funnel / sprue -->
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<path d="M3 5h18l-7 8v6l-4-2.2V13z" />
 		</svg>
 	{:else if id === 'vents'}
-		<!-- venting: air escaping -->
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<path d="M3 8h12a3 3 0 1 0-3-3" />
 			<path d="M3 12h16a3 3 0 1 1-3 3" />
 			<path d="M3 16h9a2.6 2.6 0 1 1-2.6 2.6" />
 		</svg>
 	{:else if id === 'keys'}
-		<!-- registration keys: two pegs aligning across the seam -->
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<circle cx="7" cy="12" r="3.4" />
 			<circle cx="17" cy="12" r="3.4" />
 			<line x1="10.4" y1="12" x2="13.6" y2="12" stroke-dasharray="1.5 1.8" />
 		</svg>
 	{:else if id === 'quality'}
-		<!-- resolution / precision: a target -->
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<circle cx="12" cy="12" r="8" />
 			<circle cx="12" cy="12" r="3.2" />
@@ -581,6 +686,8 @@
 		</svg>
 	{/if}
 {/snippet}
+
+{#snippet proTag()}<span class="pro-tag">PRO</span>{/snippet}
 
 <div class="studio">
 	<!-- ===================== HEADER ===================== -->
@@ -606,12 +713,24 @@
 			{/if}
 		</div>
 
+		<!-- account / plan -->
+		<div class="bar-account">
+			{#if !subChecked}
+				<!-- status loading: render nothing to avoid a flash -->
+			{:else if !loggedIn}
+				<a class="mini" href={LOGIN_PATH}>Sign in</a>
+			{:else if isPremium}
+				<span class="plan-chip pro">Pro</span>
+			{:else}
+				<span class="plan-chip free">Free · 1/day</span>
+				<a class="mini solid violet" href={PRICING_PATH}>Upgrade</a>
+			{/if}
+		</div>
+
 		<a class="bar-link" href="/">← Back to site</a>
 	</header>
 
 	<!-- ===================== SECOND NAVBAR: SECTION TABS ===================== -->
-	<!-- Full-width tab bar spanning the whole app, so every section label shows
-	     in full instead of being clipped/scrolled inside the narrow left panel. -->
 	<nav class="tabs">
 		{#each visibleTabs as t}
 			<button type="button" class="tab {tab === t.id ? 'on' : ''}" onclick={() => (tab = t.id)}>
@@ -655,6 +774,9 @@
 					{/if}
 					{#if fileError}<p class="err">{fileError}</p>{/if}
 					<p class="hint">The mesh should be watertight so the tool can define an inside to hollow out.</p>
+					{#if subChecked && !loggedIn}
+						<p class="hint" style="margin-top:12px;">You'll need to <a href={LOGIN_PATH} style="color:#2563eb;font-weight:600;">sign in</a> to generate — it's free, one mould per day.</p>
+					{/if}
 				</section>
 			{/if}
 
@@ -667,7 +789,8 @@
 						<span class="lbl">Mould type</span>
 						<div class="mcards">
 							{#each MOULD_CARDS as c}
-								<button type="button" class="mcard {activeCard === c.id ? 'on' : ''}" onclick={() => selectMouldCard(c)}>
+								<button type="button" class="mcard {activeCard === c.id ? 'on' : ''} {lockedCard(c.id) ? 'locked' : ''}" onclick={() => selectMouldCard(c)}>
+									{#if lockedCard(c.id)}{@render proTag()}{/if}
 									<svg class="mcard-ic" viewBox="0 0 32 32" aria-hidden="true">{@html c.svg}</svg>
 									<span class="mcard-ti">{c.title}</span>
 									<span class="mcard-tags">{#each c.tags as t}<em>{t}</em>{/each}</span>
@@ -682,7 +805,9 @@
 							<span class="lbl">Block pieces</span>
 							<div class="segs">
 								{#each seg.mould_type as o}
-									<button type="button" class="seg {params.mould_type === o.v ? 'on' : ''}" onclick={() => (params.mould_type = o.v)}>{o.l}</button>
+									<button type="button" class="seg {params.mould_type === o.v ? 'on' : ''} {lockedType(o.v) ? 'locked' : ''}" onclick={() => setMouldType(o.v)}>
+										{o.l}{#if lockedType(o.v)}{@render proTag()}{/if}
+									</button>
 								{/each}
 							</div>
 							<p class="hint">Two-part splits on a plane. Four-part adds sideways wedges for side undercuts; six-part adds top and bottom caps. Open pour is a single open-top block.</p>
@@ -994,7 +1119,9 @@
 						<span class="lbl">Voxel size</span>
 						<div class="segs">
 							{#each seg.resolution as o}
-								<button type="button" class="seg {params.resolution === o.v ? 'on' : ''}" onclick={() => (params.resolution = o.v)}>{o.l}</button>
+								<button type="button" class="seg {params.resolution === o.v ? 'on' : ''} {lockedRes(o.v) ? 'locked' : ''}" onclick={() => setResolution(o.v)}>
+									{o.l}{#if lockedRes(o.v)}{@render proTag()}{/if}
+								</button>
 							{/each}
 						</div>
 						{#if showCustomVoxel}
@@ -1010,7 +1137,9 @@
 						<span class="lbl">Cavity precision</span>
 						<div class="segs">
 							{#each seg.surface_refinement as o}
-								<button type="button" class="seg {params.surface_refinement === o.v ? 'on' : ''}" onclick={() => (params.surface_refinement = o.v)}>{o.l}</button>
+								<button type="button" class="seg {params.surface_refinement === o.v ? 'on' : ''} {lockedRefine(o.v) ? 'locked' : ''}" onclick={() => setRefinement(o.v)}>
+									{o.l}{#if lockedRefine(o.v)}{@render proTag()}{/if}
+								</button>
 							{/each}
 						</div>
 						<p class="hint">{params.surface_refinement === 'cad_exact' ? 'Every cavity vertex is projected onto the true offset surface — about ±0.01 mm, independent of voxel size, with sharp edges kept.' : 'Voxel-accurate: exact to within a fraction of the voxel size. Switch to CAD-exact for geometry-exact cavities.'}</p>
@@ -1022,11 +1151,11 @@
 
 	<!-- ===================== CENTRE: VIEWPORT ===================== -->
 	<main class="viewport">
-		{#if file && modelBuffer}
+		{#if file && modelBuffer && active}
 			<MouldPreview {modelBuffer} fileName={file.name} {params} />
-		{:else if file}
+		{:else if file && !modelBuffer}
 			<div class="vp-empty"><div class="spinner"></div><p>Reading {file.name}…</p></div>
-		{:else}
+		{:else if !file}
 			<div
 				class="vp-drop {dragOver ? 'over' : ''}"
 				role="button"
@@ -1082,17 +1211,27 @@
 				</div>
 
 				<button class="cta" type="button" disabled={!canSubmit} onclick={generate}>
-					{#if phase === 'uploading'}Generating… {elapsed}s{:else}Generate mould{/if}
+					{#if phase === 'uploading'}Generating… {elapsed}s{:else if subChecked && !loggedIn}Sign in to generate{:else}Generate mould{/if}
 				</button>
 
 				{#if phase === 'uploading'}
 					<p class="note pulse">Voxelising, sweeping cavities and meshing on the server. Typically 10–60 s.</p>
 				{:else if !file}
 					<p class="note">Upload a model to begin.</p>
+				{:else if subChecked && !loggedIn}
+					<p class="note">Generating a mould is free — you just need an account (1 mould/day).</p>
+				{:else if subChecked && !isPremium}
+					<p class="note">Free plan: 1 mould/day · Two-part box · Draft/Standard voxel. <a href={PRICING_PATH} style="color:#7c3aed;font-weight:600;">Go Pro</a> for silicone, multi-part, Fine/CAD-exact & unlimited.</p>
 				{/if}
 
 				{#if phase === 'error'}
-					<div class="alert err-a"><strong>Generation failed</strong><p>{errorMsg}</p></div>
+					<div class="alert err-a">
+						<strong>{showUpgrade ? 'Upgrade required' : 'Generation failed'}</strong>
+						<p>{errorMsg}</p>
+						{#if showUpgrade}
+							<button class="up-btn" type="button" onclick={goUpgrade}>See Akritio Pro →</button>
+						{/if}
+					</div>
 				{/if}
 			</section>
 
@@ -1139,6 +1278,9 @@
 						<div class="alert err-a" style="margin-top:10px;"><strong>Download problem</strong><p>{errorMsg}{#if !mouldToken && !downloadUrl} Press <em>Generate mould</em> again to make a fresh package.{/if}</p></div>
 					{/if}
 					<p class="note">{zipDownloaded ? 'Saved to your device — the package is removed from the server once delivered.' : downloading ? 'Fetching the package…' : `The ZIP contains the ${report.mould_style === 'silicone_box' ? 'box STL' : 'mould STL'}${report.pieces > 1 ? 's' : ''} and report.json. It can be downloaded once.`}</p>
+					{#if !isPremium && freeUsedToday}
+						<p class="note">That's today's free mould. <a href={PRICING_PATH} style="color:#7c3aed;font-weight:600;">Upgrade to Pro</a> for unlimited generations.</p>
+					{/if}
 				</section>
 			{/if}
 		</div>
@@ -1159,13 +1301,11 @@
 		--blue-600: #2563eb;
 		--violet: #8b5cf6;
 		--cyan: #06b6d4;
-
 		position: fixed;
 		inset: 0;
 		z-index: 60;
 		display: grid;
 		grid-template-columns: 320px 1fr 300px;
-		/* header · full-width section navbar · content */
 		grid-template-rows: 54px auto 1fr;
 		background: var(--soft);
 		color: var(--ink);
@@ -1173,703 +1313,155 @@
 		font-size: 14px;
 		overflow: hidden;
 	}
+	.bar { grid-column: 1 / -1; display: flex; align-items: center; gap: 18px; padding: 0 16px; background: #fff; border-bottom: 1px solid var(--line); }
+	.brand { display: inline-flex; align-items: center; gap: 9px; font-family: 'Space Grotesk', 'Inter', sans-serif; font-weight: 700; font-size: 15px; color: var(--ink); letter-spacing: -0.01em; }
+	.brand b { font-weight: 500; color: var(--muted); }
+	.bar-file { display: flex; align-items: center; gap: 8px; margin-left: 6px; }
+	.fchip { display: inline-flex; align-items: center; gap: 8px; background: var(--soft); border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; max-width: 260px; }
+	.fname { font-size: 12.5px; font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.fsize { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; color: var(--muted); flex: none; }
+	.mini { font-family: inherit; font-size: 12.5px; font-weight: 600; border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 999px; padding: 6px 14px; cursor: pointer; transition: border-color 0.15s; text-decoration: none; }
+	.mini:hover { border-color: var(--violet); }
+	.mini.solid { background: var(--ink); color: #fff; border-color: var(--ink); }
+	.mini.solid.violet { background: #7c3aed; border-color: #7c3aed; }
+	.mini.solid.violet:hover { background: #6d28d9; border-color: #6d28d9; }
+	.bar-account { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+	.plan-chip { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }
+	.plan-chip.free { color: var(--muted); background: var(--soft); border: 1px solid var(--line); }
+	.plan-chip.pro { color: #6d28d9; background: #f5f3ff; border: 1px solid #ddd6fe; }
+	.bar-link { margin-left: 16px; font-size: 13px; color: var(--muted); text-decoration: none; }
+	.bar-link:hover { color: var(--ink); }
 
-	/* header */
-	.bar {
-		grid-column: 1 / -1;
-		display: flex;
-		align-items: center;
-		gap: 18px;
-		padding: 0 16px;
-		background: #fff;
-		border-bottom: 1px solid var(--line);
-	}
-	.brand {
-		display: inline-flex;
-		align-items: center;
-		gap: 9px;
-		font-family: 'Space Grotesk', 'Inter', sans-serif;
-		font-weight: 700;
-		font-size: 15px;
-		color: var(--ink);
-		letter-spacing: -0.01em;
-	}
-	.brand b {
-		font-weight: 500;
-		color: var(--muted);
-	}
-	.bar-file {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		margin-left: 6px;
-	}
-	.fchip {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		background: var(--soft);
-		border: 1px solid var(--line);
-		border-radius: 999px;
-		padding: 5px 12px;
-		max-width: 260px;
-	}
-	.fname {
-		font-size: 12.5px;
-		font-weight: 550;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.fsize {
-		font-family: ui-monospace, Menlo, monospace;
-		font-size: 10.5px;
-		color: var(--muted);
-		flex: none;
-	}
-	.mini {
-		font-family: inherit;
-		font-size: 12.5px;
-		font-weight: 600;
-		border: 1px solid var(--line);
-		background: #fff;
-		color: var(--ink);
-		border-radius: 999px;
-		padding: 6px 14px;
-		cursor: pointer;
-		transition: border-color 0.15s;
-	}
-	.mini:hover {
-		border-color: var(--violet);
-	}
-	.mini.solid {
-		background: var(--ink);
-		color: #fff;
-		border-color: var(--ink);
-	}
-	.bar-link {
-		margin-left: auto;
-		font-size: 13px;
-		color: var(--muted);
-	}
-	.bar-link:hover {
-		color: var(--ink);
-	}
+	.tabs { grid-column: 1 / -1; grid-row: 2; display: flex; align-items: center; gap: 4px; padding: 8px 16px; background: #fff; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: thin; }
+	.props { grid-row: 3; display: flex; flex-direction: column; background: #fff; border-right: 1px solid var(--line); min-height: 0; }
+	.tab { display: inline-flex; align-items: center; gap: 7px; font-family: inherit; font-size: 12.5px; font-weight: 600; color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 8px; padding: 6px 11px; cursor: pointer; white-space: nowrap; transition: all 0.14s; }
+	.tab:hover { color: var(--ink); background: var(--soft); }
+	.tab.on { color: #fff; background: var(--ink); }
+	.tab-ico { display: inline-flex; flex: none; color: inherit; }
+	.tab-ico svg { display: block; }
+	.tab-lbl { line-height: 1; }
+	.props-body { flex: 1; overflow-y: auto; padding: 18px 16px 40px; min-height: 0; }
 
-	/* full-width section navbar (row 2, spans every column) */
-	.tabs {
-		grid-column: 1 / -1;
-		grid-row: 2;
-		display: flex;
-		align-items: center;
-		gap: 4px;
-		padding: 8px 16px;
-		background: #fff;
-		border-bottom: 1px solid var(--line);
-		overflow-x: auto;
-		scrollbar-width: thin;
-	}
+	.grp + .grp { margin-top: 26px; }
+	.grp h3 { font-family: 'Space Grotesk', 'Inter', sans-serif; font-size: 14px; font-weight: 650; margin: 0 0 16px; }
 
-	/* left properties */
-	.props {
-		grid-row: 3;
-		display: flex;
-		flex-direction: column;
-		background: #fff;
-		border-right: 1px solid var(--line);
-		min-height: 0;
-	}
-	.tab {
-		display: inline-flex;
-		align-items: center;
-		gap: 7px;
-		font-family: inherit;
-		font-size: 12.5px;
-		font-weight: 600;
-		color: var(--muted);
-		background: transparent;
-		border: 1px solid transparent;
-		border-radius: 8px;
-		padding: 6px 11px;
-		cursor: pointer;
-		white-space: nowrap;
-		transition: all 0.14s;
-	}
-	.tab:hover {
-		color: var(--ink);
-		background: var(--soft);
-	}
-	.tab.on {
-		color: #fff;
-		background: var(--ink);
-	}
-	/* tab icons — inherit the button's text colour so they track hover/active */
-	.tab-ico {
-		display: inline-flex;
-		flex: none;
-		color: inherit;
-	}
-	.tab-ico svg {
-		display: block;
-	}
-	.tab-lbl {
-		line-height: 1;
-	}
-	.props-body {
-		flex: 1;
-		overflow-y: auto;
-		padding: 18px 16px 40px;
-		min-height: 0;
-	}
+	.drop { border: 1.5px dashed var(--line); border-radius: 12px; padding: 26px 16px; text-align: center; cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+	.drop:hover, .drop.over { border-color: var(--violet); background: #faf9ff; }
+	.drop-t { font-size: 13.5px; font-weight: 550; margin: 0 0 3px; }
+	.drop-h { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; letter-spacing: 0.06em; color: var(--muted); margin: 0; }
 
-	.grp + .grp {
-		margin-top: 26px;
-	}
-	.grp h3 {
-		font-family: 'Space Grotesk', 'Inter', sans-serif;
-		font-size: 14px;
-		font-weight: 650;
-		margin: 0 0 16px;
-	}
+	.file-row { display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+	.file-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+	.file-name { font-size: 13px; font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.file-size { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; color: var(--muted); }
+	.ghost { border: 1px solid var(--line); background: transparent; border-radius: 999px; padding: 6px 13px; font-size: 12px; cursor: pointer; color: var(--ink); flex: none; font-family: inherit; }
+	.ghost:hover { border-color: var(--ink); }
 
-	/* dropzone (left) */
-	.drop {
-		border: 1.5px dashed var(--line);
-		border-radius: 12px;
-		padding: 26px 16px;
-		text-align: center;
-		cursor: pointer;
-		transition: border-color 0.15s, background 0.15s;
-	}
-	.drop:hover,
-	.drop.over {
-		border-color: var(--violet);
-		background: #faf9ff;
-	}
-	.drop-t {
-		font-size: 13.5px;
-		font-weight: 550;
-		margin: 0 0 3px;
-	}
-	.drop-h {
-		font-family: ui-monospace, Menlo, monospace;
-		font-size: 10.5px;
-		letter-spacing: 0.06em;
-		color: var(--muted);
-		margin: 0;
-	}
+	.field { margin-bottom: 18px; }
+	.field:last-child { margin-bottom: 0; }
+	.lbl { display: block; font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+	.hint { font-size: 12px; color: var(--muted); line-height: 1.5; margin: 8px 0 0; }
+	.hint a { text-decoration: none; }
+	.hint a:hover { text-decoration: underline; }
+	.err { color: #dc2626; font-size: 12.5px; margin: 8px 0 0; }
 
-	.file-row {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		border: 1px solid var(--line);
-		border-radius: 10px;
-		padding: 12px 14px;
-	}
-	.file-meta {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		min-width: 0;
-	}
-	.file-name {
-		font-size: 13px;
-		font-weight: 550;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.file-size {
-		font-family: ui-monospace, Menlo, monospace;
-		font-size: 10.5px;
-		color: var(--muted);
-	}
-	.ghost {
-		border: 1px solid var(--line);
-		background: transparent;
-		border-radius: 999px;
-		padding: 6px 13px;
-		font-size: 12px;
-		cursor: pointer;
-		color: var(--ink);
-		flex: none;
-		font-family: inherit;
-	}
-	.ghost:hover {
-		border-color: var(--ink);
-	}
+	.segs { display: flex; flex-wrap: wrap; gap: 6px; }
+	.segs.narrow .seg { min-width: 44px; justify-content: center; }
+	.seg { border: 1px solid var(--line); background: #fff; color: var(--body); border-radius: 8px; padding: 7px 12px; font-size: 12.5px; font-weight: 550; cursor: pointer; transition: all 0.14s; font-family: inherit; display: inline-flex; align-items: center; }
+	.seg:hover { border-color: #cbd5e1; color: var(--ink); }
+	.seg.on { background: var(--blue); border-color: var(--blue); color: #fff; }
+	.seg.locked { border-style: dashed; border-color: #ddd6fe; color: #94a3b8; background: #fbfaff; }
+	.seg.locked:hover { border-color: #c4b5fd; color: #7c3aed; }
+	.seg.locked.on { background: var(--blue); border-color: var(--blue); color: #fff; }
+	.pro-tag { font-size: 8.5px; font-weight: 800; letter-spacing: 0.06em; color: #7c3aed; background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 4px; padding: 1px 4px; margin-left: 6px; line-height: 1.4; }
+	.seg.on .pro-tag { color: #fff; background: rgba(255,255,255,0.22); border-color: rgba(255,255,255,0.4); }
 
-	/* fields */
-	.field {
-		margin-bottom: 18px;
-	}
-	.field:last-child {
-		margin-bottom: 0;
-	}
-	.lbl {
-		display: block;
-		font-family: ui-monospace, Menlo, monospace;
-		font-size: 10.5px;
-		letter-spacing: 0.1em;
-		text-transform: uppercase;
-		color: var(--muted);
-		margin-bottom: 8px;
-	}
-	.hint {
-		font-size: 12px;
-		color: var(--muted);
-		line-height: 1.5;
-		margin: 8px 0 0;
-	}
-	.err {
-		color: #dc2626;
-		font-size: 12.5px;
-		margin: 8px 0 0;
-	}
+	.mcards { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+	.mcard { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 5px; border: 1.5px solid var(--line); background: #fff; border-radius: 12px; padding: 11px 12px 10px; cursor: pointer; text-align: left; transition: border-color 0.14s, box-shadow 0.14s, background 0.14s; font-family: inherit; }
+	.mcard:hover { border-color: #c7d2fe; box-shadow: 0 2px 10px rgba(59,130,246,0.08); }
+	.mcard.on { border-color: var(--blue); background: #f5f8ff; box-shadow: 0 2px 12px rgba(59,130,246,0.14); }
+	.mcard.locked { border-style: dashed; border-color: #e9d5ff; background: #fbfaff; }
+	.mcard.locked:hover { border-color: #c4b5fd; box-shadow: 0 2px 10px rgba(124,58,237,0.1); }
+	.mcard.locked .pro-tag { position: absolute; top: 8px; right: 8px; margin: 0; }
+	.mcard-ic { width: 26px; height: 26px; stroke: #64748b; fill: #64748b; }
+	.mcard.on .mcard-ic { stroke: var(--blue); fill: var(--blue); }
+	.mcard-ti { font-size: 13px; font-weight: 650; color: var(--ink); line-height: 1.15; }
+	.mcard-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+	.mcard-tags em { font-style: normal; font-size: 9.5px; font-weight: 600; color: #94a3b8; background: #f1f5f9; border-radius: 5px; padding: 1px 5px; }
+	.mcard.on .mcard-tags em { color: #6366f1; background: #eef2ff; }
 
-	.segs {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 6px;
-	}
-	.segs.narrow .seg {
-		min-width: 44px;
-		justify-content: center;
-	}
-	.seg {
-		border: 1px solid var(--line);
-		background: #fff;
-		color: var(--body);
-		border-radius: 8px;
-		padding: 7px 12px;
-		font-size: 12.5px;
-		font-weight: 550;
-		cursor: pointer;
-		transition: all 0.14s;
-		font-family: inherit;
-	}
-	.seg:hover {
-		border-color: #cbd5e1;
-		color: var(--ink);
-	}
-	.seg.on {
-		background: var(--blue);
-		border-color: var(--blue);
-		color: #fff;
-	}
+	.g2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+	.g3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+	.g2 .field, .g3 .field { margin-bottom: 0; }
+	.num { display: flex; align-items: center; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: #fff; transition: border-color 0.15s; }
+	.num:focus-within { border-color: var(--blue); }
+	.num input { border: none; outline: none; padding: 9px 11px; font-size: 13.5px; width: 100%; min-width: 0; font-family: inherit; color: var(--ink); background: transparent; }
+	.num input::-webkit-outer-spin-button, .num input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+	.num input[type='number'] { -moz-appearance: textfield; appearance: textfield; }
+	.u { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; color: var(--muted); padding: 0 11px 0 4px; flex: none; }
+	.inline { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+	.inline label { font-size: 12.5px; color: var(--body); flex: none; }
+	.inline .num { max-width: 150px; }
+	.check { display: flex; gap: 10px; align-items: flex-start; font-size: 12.5px; line-height: 1.5; color: var(--body); cursor: pointer; margin-top: 4px; }
+	.check input { margin-top: 2px; width: 15px; height: 15px; accent-color: var(--blue); cursor: pointer; flex: none; }
+	.check strong { color: var(--ink); font-weight: 600; }
 
-	/* card-style mould type picker */
-	.mcards {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 9px;
-	}
-	.mcard {
-		display: flex;
-		flex-direction: column;
-		align-items: flex-start;
-		gap: 5px;
-		border: 1.5px solid var(--line);
-		background: #fff;
-		border-radius: 12px;
-		padding: 11px 12px 10px;
-		cursor: pointer;
-		text-align: left;
-		transition: border-color 0.14s, box-shadow 0.14s, background 0.14s;
-		font-family: inherit;
-	}
-	.mcard:hover {
-		border-color: #c7d2fe;
-		box-shadow: 0 2px 10px rgba(59, 130, 246, 0.08);
-	}
-	.mcard.on {
-		border-color: var(--blue);
-		background: #f5f8ff;
-		box-shadow: 0 2px 12px rgba(59, 130, 246, 0.14);
-	}
-	.mcard-ic {
-		width: 26px;
-		height: 26px;
-		stroke: #64748b;
-		fill: #64748b;
-	}
-	.mcard.on .mcard-ic {
-		stroke: var(--blue);
-		fill: var(--blue);
-	}
-	.mcard-ti {
-		font-size: 13px;
-		font-weight: 650;
-		color: var(--ink);
-		line-height: 1.15;
-	}
-	.mcard-tags {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 4px;
-	}
-	.mcard-tags em {
-		font-style: normal;
-		font-size: 9.5px;
-		font-weight: 600;
-		color: #94a3b8;
-		background: #f1f5f9;
-		border-radius: 5px;
-		padding: 1px 5px;
-	}
-	.mcard.on .mcard-tags em {
-		color: #6366f1;
-		background: #eef2ff;
-	}
+	.viewport { grid-row: 3; position: relative; min-width: 0; min-height: 0; background: radial-gradient(ellipse at 30% 20%, #f8fafc 0%, #eef2f7 100%); }
+	.vp-drop, .vp-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; text-align: center; color: var(--muted); }
+	.vp-drop { cursor: pointer; margin: 22px; inset: 0; border: 2px dashed #cbd5e1; border-radius: 20px; transition: border-color 0.15s, background 0.15s; }
+	.vp-drop.over { border-color: var(--violet); background: rgba(139,92,246,0.05); }
+	.vp-icon { width: 40px; height: 40px; color: #94a3b8; margin-bottom: 8px; }
+	.vp-t { font-family: 'Space Grotesk', 'Inter', sans-serif; font-size: 18px; font-weight: 600; color: var(--ink); margin: 0; }
+	.vp-h { font-size: 13px; margin: 0; }
+	.spinner { width: 26px; height: 26px; border: 3px solid #e2e8f0; border-top-color: var(--blue); border-radius: 50%; animation: spin 0.8s linear infinite; }
+	@keyframes spin { to { transform: rotate(360deg); } }
 
-	.g2 {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 14px;
-		margin-bottom: 16px;
-	}
-	.g3 {
-		display: grid;
-		grid-template-columns: 1fr 1fr 1fr;
-		gap: 12px;
-		margin-bottom: 14px;
-	}
-	.g2 .field,
-	.g3 .field {
-		margin-bottom: 0;
-	}
+	.inspector { grid-row: 3; background: #fff; border-left: 1px solid var(--line); min-height: 0; overflow: hidden; }
+	.ins-scroll { height: 100%; overflow-y: auto; padding: 18px 16px 40px; }
+	.rows { display: flex; flex-direction: column; margin-bottom: 8px; }
+	.row { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid #f1f5f9; font-size: 12.5px; color: var(--muted); }
+	.row:last-child { border-bottom: none; }
+	.row .v { color: var(--ink); font-weight: 550; text-align: right; max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-	.num {
-		display: flex;
-		align-items: center;
-		border: 1px solid var(--line);
-		border-radius: 9px;
-		overflow: hidden;
-		background: #fff;
-		transition: border-color 0.15s;
-	}
-	.num:focus-within {
-		border-color: var(--blue);
-	}
-	.num input {
-		border: none;
-		outline: none;
-		padding: 9px 11px;
-		font-size: 13.5px;
-		width: 100%;
-		min-width: 0;
-		font-family: inherit;
-		color: var(--ink);
-		background: transparent;
-	}
-	.num input::-webkit-outer-spin-button,
-	.num input::-webkit-inner-spin-button {
-		-webkit-appearance: none;
-		margin: 0;
-	}
-	.num input[type='number'] {
-		-moz-appearance: textfield;
-		appearance: textfield;
-	}
-	.u {
-		font-family: ui-monospace, Menlo, monospace;
-		font-size: 10.5px;
-		color: var(--muted);
-		padding: 0 11px 0 4px;
-		flex: none;
-	}
-	.inline {
-		display: flex;
-		align-items: center;
-		gap: 12px;
-		margin-top: 10px;
-	}
-	.inline label {
-		font-size: 12.5px;
-		color: var(--body);
-		flex: none;
-	}
-	.inline .num {
-		max-width: 150px;
-	}
+	.cta { width: 100%; margin-top: 14px; background: var(--ink); color: #fff; border: none; border-radius: 10px; padding: 12px 20px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; transition: opacity 0.15s, transform 0.1s; }
+	.cta:hover:not(:disabled) { opacity: 0.92; }
+	.cta:active:not(:disabled) { transform: scale(0.99); }
+	.cta:disabled { opacity: 0.4; cursor: not-allowed; }
+	.cta.light { background: var(--blue); }
+	.note { font-size: 11.5px; color: var(--muted); line-height: 1.5; margin: 10px 0 0; text-align: center; }
+	.note a { text-decoration: none; }
+	.note a:hover { text-decoration: underline; }
+	.pulse { animation: pulse 1.6s ease-in-out infinite; }
+	@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 
-	.check {
-		display: flex;
-		gap: 10px;
-		align-items: flex-start;
-		font-size: 12.5px;
-		line-height: 1.5;
-		color: var(--body);
-		cursor: pointer;
-		margin-top: 4px;
-	}
-	.check input {
-		margin-top: 2px;
-		width: 15px;
-		height: 15px;
-		accent-color: var(--blue);
-		cursor: pointer;
-		flex: none;
-	}
-	.check strong {
-		color: var(--ink);
-		font-weight: 600;
-	}
+	.alert { border-radius: 9px; padding: 12px 14px; font-size: 12.5px; line-height: 1.5; margin-top: 14px; }
+	.alert strong { display: block; margin-bottom: 4px; }
+	.alert p { margin: 0; }
+	.alert ul { margin: 6px 0 0; padding-left: 16px; }
+	.err-a { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
+	.warn-a { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; }
+	.up-btn { margin-top: 10px; width: 100%; border: none; cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 700; color: #fff; background: #7c3aed; border-radius: 9px; padding: 10px 14px; transition: background 0.15s; }
+	.up-btn:hover { background: #6d28d9; }
 
-	/* centre viewport */
-	.viewport {
-		grid-row: 3;
-		position: relative;
-		min-width: 0;
-		min-height: 0;
-		background: radial-gradient(ellipse at 30% 20%, #f8fafc 0%, #eef2f7 100%);
-	}
-	.vp-drop,
-	.vp-empty {
-		position: absolute;
-		inset: 0;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		justify-content: center;
-		gap: 6px;
-		text-align: center;
-		color: var(--muted);
-	}
-	.vp-drop {
-		cursor: pointer;
-		margin: 22px;
-		inset: 0;
-		border: 2px dashed #cbd5e1;
-		border-radius: 20px;
-		transition: border-color 0.15s, background 0.15s;
-	}
-	.vp-drop.over {
-		border-color: var(--violet);
-		background: rgba(139, 92, 246, 0.05);
-	}
-	.vp-icon {
-		width: 40px;
-		height: 40px;
-		color: #94a3b8;
-		margin-bottom: 8px;
-	}
-	.vp-t {
-		font-family: 'Space Grotesk', 'Inter', sans-serif;
-		font-size: 18px;
-		font-weight: 600;
-		color: var(--ink);
-		margin: 0;
-	}
-	.vp-h {
-		font-size: 13px;
-		margin: 0;
-	}
-	.spinner {
-		width: 26px;
-		height: 26px;
-		border: 3px solid #e2e8f0;
-		border-top-color: var(--blue);
-		border-radius: 50%;
-		animation: spin 0.8s linear infinite;
-	}
-	@keyframes spin {
-		to {
-			transform: rotate(360deg);
-		}
-	}
+	.res { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px; }
+	.res-i { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+	.res-i.hl .rv { color: var(--violet); }
+	.rl { font-family: ui-monospace, Menlo, monospace; font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+	.rv { font-size: 12.5px; font-weight: 550; color: var(--ink); }
 
-	/* right inspector */
-	.inspector {
-		grid-row: 3;
-		background: #fff;
-		border-left: 1px solid var(--line);
-		min-height: 0;
-		overflow: hidden;
-	}
-	.ins-scroll {
-		height: 100%;
-		overflow-y: auto;
-		padding: 18px 16px 40px;
-	}
-	.rows {
-		display: flex;
-		flex-direction: column;
-		margin-bottom: 8px;
-	}
-	.row {
-		display: flex;
-		justify-content: space-between;
-		gap: 12px;
-		padding: 7px 0;
-		border-bottom: 1px solid #f1f5f9;
-		font-size: 12.5px;
-		color: var(--muted);
-	}
-	.row:last-child {
-		border-bottom: none;
-	}
-	.row .v {
-		color: var(--ink);
-		font-weight: 550;
-		text-align: right;
-		max-width: 62%;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-
-	.cta {
-		width: 100%;
-		margin-top: 14px;
-		background: var(--ink);
-		color: #fff;
-		border: none;
-		border-radius: 10px;
-		padding: 12px 20px;
-		font-size: 14px;
-		font-weight: 600;
-		cursor: pointer;
-		font-family: inherit;
-		transition: opacity 0.15s, transform 0.1s;
-	}
-	.cta:hover:not(:disabled) {
-		opacity: 0.92;
-	}
-	.cta:active:not(:disabled) {
-		transform: scale(0.99);
-	}
-	.cta:disabled {
-		opacity: 0.4;
-		cursor: not-allowed;
-	}
-	.cta.light {
-		background: var(--blue);
-	}
-	.note {
-		font-size: 11.5px;
-		color: var(--muted);
-		line-height: 1.5;
-		margin: 10px 0 0;
-		text-align: center;
-	}
-	.pulse {
-		animation: pulse 1.6s ease-in-out infinite;
-	}
-	@keyframes pulse {
-		0%,
-		100% {
-			opacity: 1;
-		}
-		50% {
-			opacity: 0.55;
-		}
-	}
-
-	.alert {
-		border-radius: 9px;
-		padding: 12px 14px;
-		font-size: 12.5px;
-		line-height: 1.5;
-		margin-top: 14px;
-	}
-	.alert strong {
-		display: block;
-		margin-bottom: 4px;
-	}
-	.alert p {
-		margin: 0;
-	}
-	.alert ul {
-		margin: 6px 0 0;
-		padding-left: 16px;
-	}
-	.err-a {
-		background: #fef2f2;
-		border: 1px solid #fecaca;
-		color: #991b1b;
-	}
-	.warn-a {
-		background: #fffbeb;
-		border: 1px solid #fde68a;
-		color: #92400e;
-	}
-
-	.res {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 12px 14px;
-	}
-	.res-i {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		min-width: 0;
-	}
-	.res-i.hl .rv {
-		color: var(--violet);
-	}
-	.rl {
-		font-family: ui-monospace, Menlo, monospace;
-		font-size: 9.5px;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--muted);
-	}
-	.rv {
-		font-size: 12.5px;
-		font-weight: 550;
-		color: var(--ink);
-	}
-
-	/* responsive: collapse to viewport + stacked panels */
 	@media (max-width: 1100px) {
-		.studio {
-			grid-template-columns: 300px 1fr;
-			/* header · navbar · (props + viewport) · inspector */
-			grid-template-rows: 54px auto 1fr auto;
-		}
-		.inspector {
-			grid-column: 1 / -1;
-			grid-row: 4;
-			border-left: none;
-			border-top: 1px solid var(--line);
-			max-height: 42vh;
-		}
+		.studio { grid-template-columns: 300px 1fr; grid-template-rows: 54px auto 1fr auto; }
+		.inspector { grid-column: 1 / -1; grid-row: 4; border-left: none; border-top: 1px solid var(--line); max-height: 42vh; }
 	}
 	@media (max-width: 720px) {
-		.studio {
-			position: absolute;
-			min-height: 100dvh;
-			grid-template-columns: 1fr;
-			/* header · navbar · viewport · props · inspector */
-			grid-template-rows: 54px auto 52vh auto auto;
-		}
-		.tabs {
-			grid-row: 2;
-		}
-		.viewport {
-			grid-row: 3;
-		}
-		.props {
-			grid-row: 4;
-			border-right: none;
-			border-top: 1px solid var(--line);
-		}
-		.inspector {
-			grid-row: 5;
-			max-height: none;
-		}
-		.bar-link {
-			display: none;
-		}
+		.studio { position: absolute; min-height: 100dvh; grid-template-columns: 1fr; grid-template-rows: 54px auto 52vh auto auto; }
+		.tabs { grid-row: 2; }
+		.viewport { grid-row: 3; }
+		.props { grid-row: 4; border-right: none; border-top: 1px solid var(--line); }
+		.inspector { grid-row: 5; max-height: none; }
+		.bar-link { display: none; }
 	}
-
 	@media (prefers-reduced-motion: reduce) {
-		.spinner,
-		.pulse {
-			animation: none;
-		}
+		.spinner, .pulse { animation: none; }
 	}
 </style>

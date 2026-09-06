@@ -2,6 +2,7 @@
 	import { reveal } from '$lib/actions/reveal.js';
 	import { site } from '$lib/content.js';
 	import { goto } from '$app/navigation';
+	import { onMount } from 'svelte';
 	import { fade, scale } from 'svelte/transition';
 
 	let { data } = $props(); // { currency: 'INR' | 'USD' } from +page.server.js
@@ -13,14 +14,38 @@
 	// Rust backend base URL. Change to your API origin (or import from $env/static/public).
 	const API_BASE = 'https://api.navi3d.in';
 
+	// ---- auth / subscription config -------------------------------------------
+	// This page targets the Akritio subscription backend (/akritio/*). If you
+	// fork it for another product, change the token key + endpoints below.
+	const AUTH_TOKEN_KEY = 'akritio_access_token';
+	const LOGIN_PATH = '/login';
+	const SIGNUP_PATH = '/signup';
+
+	let loggedIn = $state(false);
+	let alreadyPro = $state(false);
+	let subChecked = $state(false);
+
+	function getToken() {
+		if (typeof window === 'undefined') return '';
+		return (
+			localStorage.getItem(AUTH_TOKEN_KEY) ||
+			sessionStorage.getItem(AUTH_TOKEN_KEY) ||
+			''
+		);
+	}
+	function authHeaders(extra = {}) {
+		const t = getToken();
+		return t ? { ...extra, Authorization: `Bearer ${t}` } : { ...extra };
+	}
+
 	// Display prices only. The server (akritio_create_order) owns the real amounts.
 	const plans = [
 		{
 			name: 'Free', id: 'free', tagline: 'Try the full studio', accent: 'var(--teal)',
 			price: { INR: 0, USD: 0 }, cta: 'Start free', href: '/mould', featured: false, soon: false,
 			features: [
-				'Full 3D mould studio', 'STL · OBJ · 3MF · STEP upload', 'Up to 3 mould exports / month',
-				'Block & 2-part moulds', 'Watermark-free STL'
+				'Full 3D mould studio', 'STL · OBJ · 3MF · STEP upload', '1 mould export / day',
+				'Two-part block moulds', 'Watermark-free STL'
 			]
 		},
 		{
@@ -45,6 +70,24 @@
 		const v = p.price[currency];
 		return v === 0 ? 'Free' : `${symbols[currency]}${v}`;
 	}
+
+	// On load: know if the visitor is signed in and whether they're already Pro,
+	// so the Pro card can show "Current plan" instead of charging again.
+	onMount(async () => {
+		loggedIn = !!getToken();
+		if (loggedIn) {
+			try {
+				const res = await fetch(`${API_BASE}/akritio/subscription/status`, { headers: authHeaders() });
+				if (res.ok) {
+					const j = await res.json();
+					alreadyPro = !!(j && j.active);
+				} else if (res.status === 401) {
+					loggedIn = false; // stale token
+				}
+			} catch (_) {}
+		}
+		subChecked = true;
+	});
 
 	// ===== Payment state =====
 	let paying = $state(false);
@@ -109,22 +152,21 @@
 		});
 	}
 
-	// ===== Backend calls (Rust handler) =====
+	// ===== Backend calls (Rust handler) — bearer-token auth =====
 	async function apiCreateOrder(planId) {
 		const res = await fetch(`${API_BASE}/akritio/order/create`, {
 			method: 'POST',
-			credentials: 'include', // sends the auth cookie; add an Authorization header here if you use bearer tokens
-			headers: { 'content-type': 'application/json' },
+			headers: authHeaders({ 'content-type': 'application/json' }),
 			body: JSON.stringify({ plan: planId, currency })
 		});
+		if (res.status === 401) throw new Error('unauthorized');
 		if (!res.ok) throw new Error('order');
 		return await res.json(); // { orderId, amount, currency, keyId }
 	}
 	async function apiVerify(resp) {
 		const res = await fetch(`${API_BASE}/akritio/payment/verify`, {
 			method: 'POST',
-			credentials: 'include',
-			headers: { 'content-type': 'application/json' },
+			headers: authHeaders({ 'content-type': 'application/json' }),
 			body: JSON.stringify(resp)
 		});
 		if (!res.ok) throw new Error('verify');
@@ -135,8 +177,21 @@
 	async function startCheckout(p) {
 		payError = '';
 		if (p.soon) return;
+
+		// Free plan → studio (login-gated there) or sign-up if anonymous.
 		if (!p.price || p.price[currency] === 0) {
-			if (p.href) goto(p.href);
+			goto(getToken() ? (p.href || '/mould') : SIGNUP_PATH);
+			return;
+		}
+
+		// Paid plan → LOGIN REQUIRED.
+		if (!getToken()) {
+			goto(`${LOGIN_PATH}?plan=${p.id}`);
+			return;
+		}
+		// Already subscribed → send them to the tool, don't double-charge.
+		if (alreadyPro) {
+			goto('/mould');
 			return;
 		}
 		if (paying) return;
@@ -174,13 +229,19 @@
 			}
 		} catch (e) {
 			paying = false;
-			payError = 'Could not start checkout. Please try again.';
+			if (e && e.message === 'unauthorized') {
+				payError = 'Please sign in to continue.';
+				goto(`${LOGIN_PATH}?plan=${p.id}`);
+			} else {
+				payError = 'Could not start checkout. Please try again.';
+			}
 		}
 	}
 
 	async function onPaid(plan, resp) {
 		try {
 			await apiVerify(resp);
+			alreadyPro = true;
 			goto('/welcome'); // TODO: your post-payment destination
 		} catch (e) {
 			payError = 'Payment received but verification failed — please contact support.';
@@ -339,6 +400,12 @@
 				<button class:active={currency === 'INR'} onclick={() => (currency = 'INR')} type="button">₹ INR</button>
 				<button class:active={currency === 'USD'} onclick={() => (currency = 'USD')} type="button">$ USD</button>
 			</div>
+
+			{#if subChecked && alreadyPro}
+				<p class="pro-note" use:reveal>You're on <strong>Akritio Pro</strong> — unlimited exports are unlocked. <a href="/mould">Open the studio →</a></p>
+			{:else if subChecked && !loggedIn}
+				<p class="pro-note subtle" use:reveal>Already have an account? <a href={LOGIN_PATH}>Sign in</a> to manage your plan.</p>
+			{/if}
 		</header>
 
 		<div class="cards" use:reveal={{ delay: 260 }}>
@@ -366,11 +433,13 @@
 					{#if p.soon}
 						<span class="btn plan-cta btn-disabled" aria-disabled="true">{p.cta}</span>
 					{:else if p.price[currency] === 0}
-						<a class="btn plan-cta btn-outline" href={p.href} style="--btn: {p.accent}">{p.cta}</a>
+						<a class="btn plan-cta btn-outline" href={loggedIn ? (p.href || '/mould') : SIGNUP_PATH} style="--btn: {p.accent}">{p.cta}</a>
+					{:else if alreadyPro}
+						<span class="btn plan-cta btn-disabled" aria-disabled="true">Current plan ✓</span>
 					{:else}
 						<button class="btn plan-cta" class:btn-accent={p.featured} class:btn-outline={!p.featured}
 							style="--btn: {p.accent}" type="button" onclick={() => startCheckout(p)} disabled={paying}>
-							{paying ? 'Starting…' : p.cta}
+							{paying ? 'Starting…' : loggedIn ? p.cta : 'Sign in to subscribe'}
 						</button>
 					{/if}
 
@@ -551,6 +620,12 @@
 	.cur { display: inline-flex; gap: 4px; padding: 5px; border: 1.5px solid var(--line-2); border-radius: 999px; background: var(--cloud); }
 	.cur button { border: none; background: transparent; font: inherit; font-weight: 600; font-size: 0.9rem; color: var(--slate); padding: 9px 20px; border-radius: 999px; cursor: pointer; transition: background 0.16s ease, color 0.16s ease; }
 	.cur button.active { background: var(--ink); color: #fff; }
+
+	.pro-note { margin: 18px auto 0; font-size: 0.92rem; color: #065f46; background: color-mix(in srgb, var(--teal) 12%, #fff); border: 1px solid color-mix(in srgb, var(--teal) 32%, #fff); border-radius: 999px; padding: 8px 16px; display: inline-block; }
+	.pro-note a { color: var(--ink); font-weight: 700; text-decoration: none; }
+	.pro-note a:hover { text-decoration: underline; }
+	.pro-note.subtle { color: var(--slate); background: var(--cloud); border-color: var(--line); }
+	.pro-note.subtle a { color: var(--violet); }
 
 	.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; align-items: start; }
 	.card { position: relative; background: #fff; border: 1.5px solid var(--line); border-radius: 24px; padding: 30px 26px; box-shadow: var(--shadow-md); }
