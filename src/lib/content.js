@@ -12,7 +12,7 @@ export const site = {
 	poweredBy: 'Navi3D',
 	tagline: 'Turn any 3D model into a print-ready mould',
 	description:
-		'Mould Generator is a free online tool that turns any 3D model into a two-part, print-ready mould. Detect the parting line, add registration keys, sprue and vents, then export STL for FDM or resin and cast in silicone, resin, concrete and wax. Works for both mould and mold makers. Powered by Navi3D.',
+		'Mould Generator is a free online tool that turns any 3D model into a two-part, print-ready mould. Detect the parting line, add registration keys, sprue and vents, then export STL for FDM or resin — print it yourself or have Navi3D print and ship it. Cast in silicone, resin, concrete and wax. Works for both mould and mold makers. Powered by Navi3D.',
 	ogImage: '/og-image.png',
 	twitter: '@navi3d',
 	locale: 'en'
@@ -62,7 +62,7 @@ export const features = [
 	},
 	{
 		title: 'Print-ready STL export',
-		body: 'Download watertight, manifold STL files that slice cleanly in Cura, PrusaSlicer, Bambu Studio or Orca.'
+		body: 'Download watertight, manifold STLs that slice cleanly in Cura, PrusaSlicer, Bambu Studio or Orca — or hand them to Navi3D to print.'
 	}
 ];
 
@@ -80,15 +80,11 @@ export const steps = [
 	{
 		n: '03',
 		title: 'Export & print',
-		body: 'Download the mould halves as STL, print them on FDM or resin, then cast in the material of your choice.'
+		body: 'Download the mould halves as STL and run them on your own FDM or resin printer — or send the job to Navi3D and we print and ship it to you.'
 	}
 ];
 
 export const useCases = [
-	{
-		title: 'Jewellery & casting',
-		body: 'Moulds for lost-PLA metal casting and resin gems, with crisp registration and ±0.01 mm cavities.'
-	},
 	{
 		title: 'Prop & cosplay',
 		body: 'Cast repeat parts in resin or silicone instead of reprinting them one at a time.'
@@ -96,6 +92,10 @@ export const useCases = [
 	{
 		title: 'Product prototyping',
 		body: 'Pour short runs of urethane or silicone parts before committing to hard tooling.'
+	},
+	{
+		title: 'Candles & soap',
+		body: 'Reusable silicone moulds for candles, soaps and wax melts from any 3D shape.'
 	},
 	{
 		title: 'Baking & confectionery',
@@ -132,15 +132,15 @@ export const mouldTypes = {
 		printIn: 'Standard · Tough · High-temp resin',
 		surface: 'Smooth straight off the plate — crisp edges and fine texture transfer cleanly to the cast.',
 		bestFor: [
-			'Jewellery, signets and fine detail',
 			'Miniatures and intricate geometry',
 			'Master models for silicone moulds',
 			'Watertight moulds with no sealing needed',
-			'Short-run resin and wax casts'
+			'Short-run resin and wax casts',
+			'Fine surface detail and lettering'
 		],
 		watch: 'Wash and fully cure prints or platinum-cure silicone may not set — use tin-cure silicone or a barrier coat. Resin moulds are not food-safe.'
 	},
-	rule: 'Choose FDM for size and strength, resin for detail and finish. Mould Generator exports clean STLs for both.'
+	rule: 'Choose FDM for size and strength, resin for detail and finish. Mould Generator exports clean STLs for both — print them yourself or through Navi3D.'
 };
 
 export const faqs = [
@@ -150,7 +150,11 @@ export const faqs = [
 	},
 	{
 		q: 'Should I print my mould on an FDM or a resin printer?',
-		a: 'Use FDM for large, strong moulds and for casting concrete, plaster or silicone negatives — it is cheaper with a bigger build volume. Use a resin (SLA/MSLA) printer when you need fine detail and a smooth finish, such as jewellery masters or miniatures. Mould Generator exports STLs that suit either.'
+		a: 'Use FDM for large, strong moulds and for casting concrete, plaster or silicone negatives — it is cheaper with a bigger build volume. Use a resin (SLA/MSLA) printer when you need fine detail and a smooth finish, such as miniatures or lettered pieces. Mould Generator exports STLs that suit either.'
+	},
+	{
+		q: 'What if I don’t have a printer?',
+		a: 'You don’t need one. Generate the mould here, then send the STLs to Navi3D — the team behind this tool — and we print them on production FDM and SLA machines in Navi Mumbai and ship them to you. If you do have a printer, just download and print it yourself.'
 	},
 	{
 		q: 'What file formats can I upload?',
@@ -166,11 +170,11 @@ export const faqs = [
 	},
 	{
 		q: 'Is the Mould Generator free?',
-		a: 'Yes, the core generator is free to use in your browser. You can upload a model, tune the mould in the studio and export STL files at no cost.'
+		a: 'Yes, the core generator is free to use in your browser — upload a model, tune the mould in the studio and export a print-ready STL each day at no cost. Go Pro for unlimited exports, silicone and multi-part moulds, and CAD-exact precision.'
 	},
 	{
 		q: 'Who makes this?',
-		a: 'Mould Generator is built and powered by Navi3D, a 3D printing and fabrication studio. The generator itself is a free online tool — you export your mould as STL files and print them yourself on any FDM or resin printer.'
+		a: 'Mould Generator is built and powered by Navi3D, a 3D printing and fabrication studio in Navi Mumbai. The generator is a free online tool — export your mould as STL and print it yourself on any FDM or resin printer, or let Navi3D print and ship it for you.'
 	}
 ];
 

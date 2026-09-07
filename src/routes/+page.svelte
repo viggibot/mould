@@ -5,6 +5,7 @@
 	import Features from '$lib/components/Features.svelte';
 	import HowItWorks from '$lib/components/HowItWorks.svelte';
 	import MouldTypes from '$lib/components/MouldTypes.svelte';
+	import PrintYourWay from '$lib/components/PrintYourWay.svelte';
 	import Materials from '$lib/components/Materials.svelte';
 	import UseCases from '$lib/components/UseCases.svelte';
 	// import Manufacture from '$lib/components/Manufacture.svelte';
@@ -20,6 +21,7 @@
 <Features />
 <HowItWorks />
 <MouldTypes />
+<PrintYourWay />
 <Materials />
 <UseCases />
 <!-- <Manufacture /> -->

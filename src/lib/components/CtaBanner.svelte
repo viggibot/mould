@@ -1,6 +1,8 @@
 <script>
 	import { reveal } from '$lib/actions/reveal.js';
 	import { site } from '$lib/content.js';
+
+	const NAVI3D = site?.poweredBy ?? 'Navi3D';
 </script>
 
 <section class="cta-wrap">
@@ -17,13 +19,12 @@
 			<div class="inner">
 				<p class="eyebrow" style="--tint: var(--coral-t); --tint-ink: var(--coral)">Ready when you are</p>
 				<h2>Make your first mould in the <span class="mark">next five minutes</span></h2>
-				<!-- EDIT: replace the benefit text with your actual paid-tier perks -->
-				<p class="lede">Upload a model, tune the split, export STL. Start free — subscribe for unlimited moulds and premium exports.</p>
+				<p class="lede">Upload a model, tune the split, export STL. Print it yourself, or let {NAVI3D} print and ship it. Start free — go Pro for unlimited moulds, silicone &amp; multi-part exports.</p>
 				<div class="actions">
 					<a class="btn btn-accent big" href="/mould" style="--btn: var(--coral)">Open the generator →</a>
 					<a class="btn btn-outline" href="/pricing">See pricing</a>
 				</div>
-				<p class="by">Powered by {site.poweredBy}</p>
+				<p class="by">Powered by {NAVI3D}</p>
 			</div>
 		</div>
 	</div>
@@ -59,6 +60,8 @@
 		color: var(--slate);
 		font-size: 1.14rem;
 		margin-bottom: 28px;
+		max-width: 54ch;
+		margin-inline: auto;
 	}
 	.actions {
 		display: flex;
