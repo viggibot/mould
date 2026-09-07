@@ -4,10 +4,17 @@
 	import Footer from '$lib/components/Footer.svelte';
 
 	let { children } = $props();
-	let isStudio = $derived($page.url.pathname.startsWith('/mould'));
+
+	// Routes that render their own full-screen chrome — skip the site nav/footer.
+	// The studio (/mould) plus the auth pages (/login, /signup) are standalone.
+	let bare = $derived(
+		$page.url.pathname.startsWith('/mould') ||
+			$page.url.pathname.startsWith('/login') ||
+			$page.url.pathname.startsWith('/signup')
+	);
 </script>
 
-{#if isStudio}
+{#if bare}
 	{@render children?.()}
 {:else}
 	<a class="skip-link" href="#main">Skip to content</a>
