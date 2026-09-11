@@ -328,6 +328,10 @@
 	let elapsedTimer = null;
 
 	// ---- lifecycle: know who's signed in + whether they're Pro -------------
+	// CHANGED: non-OK responses are no longer swallowed silently. If the status
+	// endpoint returns anything other than 200 (and it isn't a 401 stale-token),
+	// we log the status + body so a broken allowlist / routing / base-URL issue
+	// is visible in the browser console instead of just leaving isPremium false.
 	onMount(async () => {
 		loggedIn = !!getToken();
 		if (!loggedIn) { subChecked = true; return; }
@@ -336,10 +340,19 @@
 			if (res.ok) {
 				const j = await res.json();
 				isPremium = !!(j && j.active);
+				console.debug('[akritio] subscription status', j);
 			} else if (res.status === 401) {
 				loggedIn = false; // stale token
+				console.warn('[akritio] subscription status 401 — token rejected');
+			} else {
+				// 402/404/500/HTML etc. — surface it so we can see WHY premium is off.
+				let detail = '';
+				try { detail = await res.text(); } catch (_) {}
+				console.warn('[akritio] subscription status failed', res.status, detail);
 			}
-		} catch (_) {}
+		} catch (e) {
+			console.warn('[akritio] subscription status error', e);
+		}
 		subChecked = true;
 	});
 
