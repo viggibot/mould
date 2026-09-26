@@ -4,6 +4,9 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { fade, scale } from 'svelte/transition';
+	import { PUBLIC_API_BASE_URL } from '$env/static/public';
+	// ADJUST the path if your auth store lives elsewhere.
+	import { initAuth, authFetch, getValidAccessToken, fetchSubscriptionStatus } from '$lib/stores/auth.js';
 
 	let { data } = $props(); // { currency: 'INR' | 'USD' } from +page.server.js
 
@@ -11,32 +14,21 @@
 	let currency = $state(data?.currency ?? 'USD');
 	const symbols = { INR: '₹', USD: '$' };
 
-	// Rust backend base URL. Change to your API origin (or import from $env/static/public).
-	const API_BASE = 'https://api.navi3d.in';
+	// Rust backend base URL — same env var as the rest of the app (was hardcoded).
+	const API_BASE = PUBLIC_API_BASE_URL;
 
-	// ---- auth / subscription config -------------------------------------------
-	// This page targets the Akritio subscription backend (/akritio/*). If you
-	// fork it for another product, change the token key + endpoints below.
-	const AUTH_TOKEN_KEY = 'akritio_access_token';
+	// ---- auth / subscription -------------------------------------------------
+	// All calls go through authFetch() from the auth store: it refreshes an
+	// expired access token first and retries once on 401. Previously this page
+	// sent the raw stored token — if it had expired (e.g. during a long
+	// checkout), /payment/verify got 401 AFTER the customer had paid.
 	const LOGIN_PATH = '/login';
 	const SIGNUP_PATH = '/signup';
+	const AFTER_PAYMENT_PATH = '/mould'; // straight into the studio with Pro unlocked
 
 	let loggedIn = $state(false);
 	let alreadyPro = $state(false);
 	let subChecked = $state(false);
-
-	function getToken() {
-		if (typeof window === 'undefined') return '';
-		return (
-			localStorage.getItem(AUTH_TOKEN_KEY) ||
-			sessionStorage.getItem(AUTH_TOKEN_KEY) ||
-			''
-		);
-	}
-	function authHeaders(extra = {}) {
-		const t = getToken();
-		return t ? { ...extra, Authorization: `Bearer ${t}` } : { ...extra };
-	}
 
 	// Display prices only. The server (akritio_create_order) owns the real amounts.
 	const plans = [
@@ -44,7 +36,7 @@
 			name: 'Free', id: 'free', tagline: 'Try the full studio', accent: 'var(--teal)',
 			price: { INR: 0, USD: 0 }, cta: 'Start free', href: '/mould', featured: false, soon: false,
 			features: [
-				'Full 3D mould studio', 'STL · OBJ · 3MF · STEP upload', '1 mould export / day',
+				'Full 3D mould studio', 'STL · 3MF · STEP upload', '1 mould export / day',
 				'Two-part block moulds', 'Watermark-free STL'
 			]
 		},
@@ -71,22 +63,24 @@
 		return v === 0 ? 'Free' : `${symbols[currency]}${v}`;
 	}
 
-	// On load: know if the visitor is signed in and whether they're already Pro,
-	// so the Pro card can show "Current plan" instead of charging again.
-	onMount(async () => {
-		loggedIn = !!getToken();
-		if (loggedIn) {
-			try {
-				const res = await fetch(`${API_BASE}/akritio/subscription/status`, { headers: authHeaders() });
-				if (res.ok) {
-					const j = await res.json();
-					alreadyPro = !!(j && j.active);
-				} else if (res.status === 401) {
-					loggedIn = false; // stale token
-				}
-			} catch (_) {}
-		}
+	async function checkSubscription() {
+		const s = await fetchSubscriptionStatus();
+		loggedIn = s.loggedIn;
+		if (!s.error) alreadyPro = s.active;
 		subChecked = true;
+		return s;
+	}
+
+	// On load: wait for auth (refreshes an expired token), then learn whether
+	// the visitor is signed in and already Pro, so the Pro card can show
+	// "Current plan" instead of charging again.
+	onMount(() => {
+		let alive = true;
+		(async () => {
+			await initAuth();
+			if (alive) await checkSubscription();
+		})();
+		return () => { alive = false; };
 	});
 
 	// ===== Payment state =====
@@ -152,11 +146,11 @@
 		});
 	}
 
-	// ===== Backend calls (Rust handler) — bearer-token auth =====
+	// ===== Backend calls (Rust handler) — bearer auth via authFetch =====
 	async function apiCreateOrder(planId) {
-		const res = await fetch(`${API_BASE}/akritio/order/create`, {
+		const res = await authFetch(`${API_BASE}/akritio/order/create`, {
 			method: 'POST',
-			headers: authHeaders({ 'content-type': 'application/json' }),
+			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ plan: planId, currency })
 		});
 		if (res.status === 401) throw new Error('unauthorized');
@@ -164,12 +158,17 @@
 		return await res.json(); // { orderId, amount, currency, keyId }
 	}
 	async function apiVerify(resp) {
-		const res = await fetch(`${API_BASE}/akritio/payment/verify`, {
+		const res = await authFetch(`${API_BASE}/akritio/payment/verify`, {
 			method: 'POST',
-			headers: authHeaders({ 'content-type': 'application/json' }),
+			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify(resp)
 		});
-		if (!res.ok) throw new Error('verify');
+		if (!res.ok) {
+			let detail = '';
+			try { detail = await res.text(); } catch (_) {}
+			console.warn('[akritio] verify failed', res.status, detail);
+			throw new Error('verify');
+		}
 		return await res.json();
 	}
 
@@ -180,18 +179,19 @@
 
 		// Free plan → studio (login-gated there) or sign-up if anonymous.
 		if (!p.price || p.price[currency] === 0) {
-			goto(getToken() ? (p.href || '/mould') : SIGNUP_PATH);
+			goto(loggedIn ? (p.href || '/mould') : SIGNUP_PATH);
 			return;
 		}
 
-		// Paid plan → LOGIN REQUIRED.
-		if (!getToken()) {
+		// Paid plan → LOGIN REQUIRED (refreshes an expired token if possible).
+		const token = await getValidAccessToken();
+		if (!token) {
 			goto(`${LOGIN_PATH}?plan=${p.id}`);
 			return;
 		}
 		// Already subscribed → send them to the tool, don't double-charge.
 		if (alreadyPro) {
-			goto('/mould');
+			goto(AFTER_PAYMENT_PATH);
 			return;
 		}
 		if (paying) return;
@@ -238,13 +238,35 @@
 		}
 	}
 
+	// After Razorpay reports success. The money is already taken at this point,
+	// so a failed verify must NOT look like a failed payment: the server also
+	// reconciles captured payments on its own, so we re-check the plan before
+	// showing any error.
 	async function onPaid(plan, resp) {
+		payError = '';
+		let active = false;
 		try {
-			await apiVerify(resp);
-			alreadyPro = true;
-			goto('/welcome'); // TODO: your post-payment destination
+			const v = await apiVerify(resp);
+			active = !!(v && (v.active || v.status === 'success'));
 		} catch (e) {
-			payError = 'Payment received but verification failed — please contact support.';
+			active = false;
+		}
+
+		if (!active) {
+			// Give the server a moment, then ask it (this triggers reconciliation).
+			for (let i = 0; i < 3 && !active; i++) {
+				await new Promise((r) => setTimeout(r, 1500));
+				const s = await checkSubscription();
+				active = !!s.active;
+			}
+		}
+
+		if (active) {
+			alreadyPro = true;
+			goto(AFTER_PAYMENT_PATH);
+		} else {
+			const pid = (resp && resp.razorpay_payment_id) || '';
+			payError = `Payment received — we're still confirming it. Open the studio in a minute and Pro will unlock automatically. If it doesn't, email sales@navi3d.in with payment ID ${pid}.`;
 		}
 	}
 
@@ -379,7 +401,7 @@
 
 <svelte:head>
 	<title>Pricing — Akritio</title>
-	<meta name="description" content="Akritio pricing. Start free or subscribe to Pro for unlimited casting-mould exports. Cancel anytime." />
+	<meta name="description" content="Akritio pricing. Start free or subscribe to Pro for unlimited casting-mould exports." />
 </svelte:head>
 
 <svelte:window onkeydown={modalOpen ? onOverlayKey : undefined} />
@@ -402,7 +424,7 @@
 			</div>
 
 			{#if subChecked && alreadyPro}
-				<p class="pro-note" use:reveal>You're on <strong>Akritio Pro</strong> — unlimited exports are unlocked. <a href="/mould">Open the studio →</a></p>
+				<p class="pro-note" use:reveal>You're on <strong>Akritio Pro</strong> — unlimited exports are unlocked. <a href={AFTER_PAYMENT_PATH}>Open the studio →</a></p>
 			{:else if subChecked && !loggedIn}
 				<p class="pro-note subtle" use:reveal>Already have an account? <a href={LOGIN_PATH}>Sign in</a> to manage your plan.</p>
 			{/if}
@@ -425,7 +447,7 @@
 					{#if p.soon}
 						<p class="billed">Launching soon</p>
 					{:else if p.price[currency] !== 0}
-						<p class="billed">Billed monthly · cancel anytime</p>
+						<p class="billed">30 days of Pro per payment</p>
 					{:else}
 						<p class="billed">No card required</p>
 					{/if}
@@ -461,9 +483,9 @@
 		{#if payError}<p class="pay-error" role="alert" use:reveal>{payError}</p>{/if}
 
 		<p class="terms" use:reveal>
-			Paid subscriptions renew automatically each month. You can cancel anytime from your account
-			dashboard — access continues until the end of the paid period. Prices shown in your region's
-			currency. See our <a href="/terms">Terms</a> and <a href="/privacy">Privacy Policy</a>.
+			Each Pro payment unlocks 30 days of access and does not renew automatically — you'll be
+			reminded to renew. Prices shown in your region's currency. See our <a href="/terms">Terms</a>
+			and <a href="/privacy">Privacy Policy</a>.
 		</p>
 	</div>
 </section>
@@ -481,7 +503,7 @@
 			<header class="m-head">
 				<span class="m-eyebrow"><span class="dot"></span>INTERNATIONAL · CARDS</span>
 				<h2>Subscribe to <span class="mark">{modalPlan?.name ?? ''}</span></h2>
-				<p class="m-sub">{modalAmount} / mo · billed monthly, cancel anytime</p>
+				<p class="m-sub">{modalAmount} for 30 days of Pro</p>
 			</header>
 
 			<div class="card-stage">

@@ -2,16 +2,21 @@
 	// ==========================================================================
 	// MOULD STUDIO — full-screen design studio for the mould generator.
 	//
-	// ACCESS FLOW (added):
-	//   • Generation now REQUIRES login — the request carries the Akritio JWT,
-	//     and the backend rejects anonymous calls (401).
+	// ACCESS FLOW:
+	//   • Generation REQUIRES login — every request goes through authFetch()
+	//     from the auth store, which refreshes an expired access token first and
+	//     retries once on 401. (Previously this page read the raw token from
+	//     storage on mount — BEFORE the layout's initAuth() had refreshed it —
+	//     so the plan check got 401 and Pro options stayed locked for paying
+	//     users.)
+	//   • The plan is (re)checked on mount AFTER initAuth(), whenever the tab
+	//     regains focus (e.g. back from paying in another tab), and after any
+	//     402 from the server — if the account turns out to be Pro, the
+	//     generation is retried automatically.
 	//   • Premium options are locked in the UI for free accounts and routed to
 	//     /pricing: silicone mould types, four/six-part, Fine/Custom voxel,
 	//     CAD-exact precision. The backend enforces the same set (402).
-	//   • Free accounts get 1 mould/day; the backend returns 429 and the UI
-	//     shows an upgrade prompt.
-	//   • Subscription status is fetched once on mount from
-	//     GET /akritio/subscription/status.
+	//   • Free accounts get 1 mould/day; the backend returns 429.
 	//
 	// Param names still match the backend MouldParams serde contract exactly
 	// (snake_case, `mould_type` / `mould_style`). Do not rename them.
@@ -19,15 +24,17 @@
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$env/static/public';
 	import MouldPreview from '$lib/components/MouldPreview.svelte';
+	// ADJUST the path if your auth store lives elsewhere.
+	import { initAuth, authFetch, getValidAccessToken, fetchSubscriptionStatus } from '$lib/stores/auth.js';
 
 	const API = PUBLIC_API_BASE_URL;
 	const MAX_UPLOAD_MB = 200;
 	const ACCEPT = ['.stl', '.step', '.stp', '.3mf'];
 
 	// ---- access / subscription config --------------------------------------
-	const AUTH_TOKEN_KEY = 'akritio_access_token';
 	const LOGIN_PATH = '/login';
 	const PRICING_PATH = '/pricing';
+	const SUB_RECHECK_MS = 10_000; // min gap between focus-triggered plan checks
 
 	// ---- shared file state (hosted by the studio shell) --------------------
 	// Works standalone too: local state is the fallback when no shell props
@@ -58,25 +65,34 @@
 	let loggedIn = $state(false);
 	let isPremium = $state(false);
 	let subChecked = $state(false); // becomes true once status is known
+	let subError = $state('');      // plan check failed for a non-auth reason
 	let showUpgrade = $state(false); // toggled by 402 / 429 responses
+	let lastSubCheck = 0;
 
-	function getToken() {
-		if (typeof window === 'undefined') return '';
-		return (
-			localStorage.getItem(AUTH_TOKEN_KEY) ||
-			sessionStorage.getItem(AUTH_TOKEN_KEY) ||
-			''
-		);
-	}
-	function authHeaders(extra = {}) {
-		const t = getToken();
-		return t ? { ...extra, Authorization: `Bearer ${t}` } : { ...extra };
-	}
 	function goLogin() {
 		if (typeof window !== 'undefined') window.location.assign(LOGIN_PATH);
 	}
 	function goUpgrade() {
 		if (typeof window !== 'undefined') window.location.assign(PRICING_PATH);
+	}
+
+	// Ask the server whether this account is Pro. On a transient failure the
+	// previous plan state is KEPT, so a paying user is never downgraded to Free
+	// just because one request failed.
+	async function checkSubscription(force = false) {
+		const now = Date.now();
+		if (!force && now - lastSubCheck < SUB_RECHECK_MS) return;
+		lastSubCheck = now;
+		const s = await fetchSubscriptionStatus();
+		if (s.error) {
+			subError = s.error;
+			loggedIn = s.loggedIn;
+		} else {
+			subError = '';
+			loggedIn = s.loggedIn;
+			isPremium = s.active;
+		}
+		subChecked = true;
 	}
 
 	// ---- which options are Pro-only (mirrors backend premium_features_used) --
@@ -327,33 +343,33 @@
 	let elapsed = $state(0);
 	let elapsedTimer = null;
 
+	// tracks that a free account has generated once this session (UI hint only —
+	// the server is the source of truth for the daily quota).
+	let freeUsedToday = $state(false);
+
 	// ---- lifecycle: know who's signed in + whether they're Pro -------------
-	// CHANGED: non-OK responses are no longer swallowed silently. If the status
-	// endpoint returns anything other than 200 (and it isn't a 401 stale-token),
-	// we log the status + body so a broken allowlist / routing / base-URL issue
-	// is visible in the browser console instead of just leaving isPremium false.
-	onMount(async () => {
-		loggedIn = !!getToken();
-		if (!loggedIn) { subChecked = true; return; }
-		try {
-			const res = await fetch(`${API}/akritio/subscription/status`, { headers: authHeaders() });
-			if (res.ok) {
-				const j = await res.json();
-				isPremium = !!(j && j.active);
-				console.debug('[akritio] subscription status', j);
-			} else if (res.status === 401) {
-				loggedIn = false; // stale token
-				console.warn('[akritio] subscription status 401 — token rejected');
-			} else {
-				// 402/404/500/HTML etc. — surface it so we can see WHY premium is off.
-				let detail = '';
-				try { detail = await res.text(); } catch (_) {}
-				console.warn('[akritio] subscription status failed', res.status, detail);
-			}
-		} catch (e) {
-			console.warn('[akritio] subscription status error', e);
-		}
-		subChecked = true;
+	// initAuth() is awaited FIRST so an expired access token is refreshed before
+	// the plan check (this page's onMount runs before the layout's). The plan is
+	// re-checked when the tab regains focus, so paying in another tab and coming
+	// back unlocks Pro without a reload.
+	onMount(() => {
+		let alive = true;
+		(async () => {
+			await initAuth();
+			if (alive) await checkSubscription(true);
+		})();
+
+		const onFocus = () => { checkSubscription(false); };
+		const onVisible = () => { if (document.visibilityState === 'visible') checkSubscription(false); };
+		window.addEventListener('focus', onFocus);
+		document.addEventListener('visibilitychange', onVisible);
+
+		return () => {
+			alive = false;
+			window.removeEventListener('focus', onFocus);
+			document.removeEventListener('visibilitychange', onVisible);
+			if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+		};
 	});
 
 	// ---- helpers ------------------------------------------------------------
@@ -474,12 +490,16 @@
 	}
 
 	// ---- submit -------------------------------------------------------------
-	async function generate() {
+	// `retried` is true only for the automatic second attempt made after a 402
+	// turned out to be a stale plan (the account is actually Pro).
+	async function generate(retried = false) {
 		if (!canSubmit) return;
 
-		// LOGIN REQUIRED
-		if (!getToken()) {
+		// LOGIN REQUIRED — refreshes an expired access token if possible.
+		const token = await getValidAccessToken();
+		if (!token) {
 			showUpgrade = false;
+			loggedIn = false;
 			errorMsg = 'Please sign in to generate a mould.';
 			phase = 'error';
 			setTimeout(goLogin, 900);
@@ -497,6 +517,8 @@
 		elapsed = 0;
 		elapsedTimer = setInterval(() => (elapsed += 1), 1000);
 
+		let retryAsPro = false;
+
 		try {
 			const clean = clampParams(params);
 			const fd = new FormData();
@@ -504,10 +526,9 @@
 			fd.append('file', file, file.name);
 
 			// NOTE: do not set Content-Type — the browser adds the multipart
-			// boundary. Only attach the Authorization header.
-			const res = await fetch(`${API}/calc/mould/v2/generate?source=mould_studio`, {
+			// boundary. authFetch only attaches the Authorization header.
+			const res = await authFetch(`${API}/calc/mould/v2/generate?source=mould_studio`, {
 				method: 'POST',
-				headers: authHeaders(),
 				body: fd
 			});
 
@@ -522,6 +543,7 @@
 
 			// ---- access-control responses ----
 			if (res.status === 401) {
+				// authFetch already tried a token refresh — the session is gone.
 				loggedIn = false;
 				errorMsg = 'Your session has expired — please sign in again.';
 				phase = 'error';
@@ -529,7 +551,13 @@
 				return;
 			}
 			if (res.status === 402) {
-				// PREMIUM_REQUIRED — the body lists the locked options.
+				// The server just re-checked the plan (and reconciles captured
+				// payments). Refresh our view; if we are actually Pro now, retry.
+				await checkSubscription(true);
+				if (isPremium && !retried) {
+					retryAsPro = true;
+					return;
+				}
 				const locked = (body && body.locked_features) || [];
 				errorMsg = locked.length
 					? `These options need Akritio Pro: ${locked.join(', ')}.`
@@ -540,6 +568,11 @@
 			}
 			if (res.status === 429) {
 				// DAILY_LIMIT_REACHED
+				await checkSubscription(true);
+				if (isPremium && !retried) {
+					retryAsPro = true;
+					return;
+				}
 				errorMsg =
 					(body && body.message) ||
 					'The free plan includes 1 mould per day. Upgrade to Akritio Pro for unlimited moulds.';
@@ -570,12 +603,14 @@
 				clearInterval(elapsedTimer);
 				elapsedTimer = null;
 			}
+			if (retryAsPro) {
+				// Scheduled after this call has fully unwound so the retry gets
+				// its own timer and state.
+				phase = 'idle';
+				setTimeout(() => generate(true), 0);
+			}
 		}
 	}
-
-	// tracks that a free account has generated once this session (UI hint only —
-	// the server is the source of truth for the daily quota).
-	let freeUsedToday = $state(false);
 
 	async function downloadZip() {
 		if (zipDownloaded || downloading) return;
@@ -589,7 +624,7 @@
 		downloading = true;
 		errorMsg = '';
 		try {
-			const res = await fetch(target, { method: 'GET', headers: authHeaders() });
+			const res = await authFetch(target, { method: 'GET' });
 			const ct = res.headers.get('content-type') || '';
 			if (!res.ok || ct.includes('application/json') || ct.includes('text/')) {
 				let msg = `Download failed (HTTP ${res.status}).`;
@@ -714,7 +749,6 @@
 				<circle cx="15" cy="14" r="2.4" fill="#22d3ee" />
 			</svg>
 			<span>Mould<b>Studio</b></span>
-			<span style="margin-left:8px;font-size:10px;font-weight:700;color:#7c3aed;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:999px;padding:2px 7px;">core build</span>
 		</a>
 
 		<div class="bar-file">
@@ -734,8 +768,12 @@
 				<a class="mini" href={LOGIN_PATH}>Sign in</a>
 			{:else if isPremium}
 				<span class="plan-chip pro">Pro</span>
+			{:else if subError}
+				<span class="plan-chip free" title={subError}>Plan unknown</span>
+				<button class="mini" type="button" onclick={() => checkSubscription(true)}>Retry</button>
 			{:else}
 				<span class="plan-chip free">Free · 1/day</span>
+				<button class="mini" type="button" onclick={() => checkSubscription(true)} title="Already paid? Re-check your plan">Refresh plan</button>
 				<a class="mini solid violet" href={PRICING_PATH}>Upgrade</a>
 			{/if}
 		</div>
@@ -1223,7 +1261,7 @@
 					<div class="row"><span>Precision</span><span class="v">{params.surface_refinement === 'cad_exact' ? 'CAD-exact ±0.01' : 'Voxel'}</span></div>
 				</div>
 
-				<button class="cta" type="button" disabled={!canSubmit} onclick={generate}>
+				<button class="cta" type="button" disabled={!canSubmit} onclick={() => generate()}>
 					{#if phase === 'uploading'}Generating… {elapsed}s{:else if subChecked && !loggedIn}Sign in to generate{:else}Generate mould{/if}
 				</button>
 
@@ -1233,8 +1271,10 @@
 					<p class="note">Upload a model to begin.</p>
 				{:else if subChecked && !loggedIn}
 					<p class="note">Generating a mould is free — you just need an account (1 mould/day).</p>
-				{:else if subChecked && !isPremium}
+				{:else if subChecked && !isPremium && !subError}
 					<p class="note">Free plan: 1 mould/day · Two-part box · Draft/Standard voxel. <a href={PRICING_PATH} style="color:#7c3aed;font-weight:600;">Go Pro</a> for silicone, multi-part, Fine/CAD-exact & unlimited.</p>
+				{:else if subError}
+					<p class="note">{subError} <button class="linkish" type="button" onclick={() => checkSubscription(true)}>Retry</button></p>
 				{/if}
 
 				{#if phase === 'error'}
@@ -1243,6 +1283,7 @@
 						<p>{errorMsg}</p>
 						{#if showUpgrade}
 							<button class="up-btn" type="button" onclick={goUpgrade}>See Akritio Pro →</button>
+							<button class="linkish" type="button" style="margin-top:8px;" onclick={() => checkSubscription(true)}>Already paid? Refresh my plan</button>
 						{/if}
 					</div>
 				{/if}
@@ -1444,6 +1485,8 @@
 	.note { font-size: 11.5px; color: var(--muted); line-height: 1.5; margin: 10px 0 0; text-align: center; }
 	.note a { text-decoration: none; }
 	.note a:hover { text-decoration: underline; }
+	.linkish { font-family: inherit; font-size: 12px; font-weight: 600; color: #7c3aed; background: none; border: none; padding: 0; cursor: pointer; display: inline-block; }
+	.linkish:hover { text-decoration: underline; }
 	.pulse { animation: pulse 1.6s ease-in-out infinite; }
 	@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 
