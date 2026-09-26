@@ -88,11 +88,14 @@
 								{/if}
 							</div>
 
-							<a class="menu-item" href="/mould" role="menuitem" onclick={closeMenu}>
+							<a class="menu-item" href="/profile" role="menuitem" onclick={closeMenu}>
 								<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-									<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M9 22V12h6v10" />
+									<rect x="3" y="3" width="7" height="9" rx="1.5" />
+									<rect x="14" y="3" width="7" height="5" rx="1.5" />
+									<rect x="14" y="12" width="7" height="9" rx="1.5" />
+									<rect x="3" y="16" width="7" height="5" rx="1.5" />
 								</svg>
-								Open the generator
+								Profile dashboard
 							</a>
 
 							<button class="menu-item danger" role="menuitem" onclick={handleLogout}>
