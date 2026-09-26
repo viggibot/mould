@@ -1,12 +1,80 @@
 <script>
 	// Akritio — mould generator, powered by Navi3D Studio
+	//
+	// PLAN-AWARE NAV:
+	//   • Pro accounts don't see the "Pricing" link — there's nothing to buy.
+	//   • The plan comes from fetchSubscriptionStatus() in the auth store (the
+	//     same check the studio and pricing page use), so all three agree.
+	//   • The last known plan is cached per user in sessionStorage, so a Pro
+	//     user doesn't see "Pricing" flash in and out on every page load.
+	//   • A failed check never changes the plan (keeps the last known value).
+	//   • The plan is re-checked when the user logs in/out, and when the tab
+	//     regains focus (e.g. after paying in another tab), at most once a minute.
 	import { onMount } from 'svelte';
 	// Adjust this path to wherever you placed the Akritio auth store.
-	import { authStore, initAuth, logout } from '$lib/stores/auth.js';
+	import { authStore, initAuth, logout, fetchSubscriptionStatus } from '$lib/stores/auth.js';
+
+	const PLAN_CACHE_KEY = 'akritio_nav_plan';
+	const RECHECK_MS = 60_000;
 
 	let menuOpen = $state(false);
 	let menuRef = $state(null);
 
+	// ---- plan state -----------------------------------------------------------
+	let isPro = $state(false);
+	let lastCheck = 0;
+	let checkSeq = 0; // guards against an older, slower response overwriting a newer one
+
+	let uid = $derived($authStore.isLoggedIn && $authStore.user ? $authStore.user.id : null);
+
+	function readCache(id) {
+		try {
+			const c = JSON.parse(sessionStorage.getItem(PLAN_CACHE_KEY) || 'null');
+			return c && c.uid === id ? !!c.pro : null;
+		} catch (_) {
+			return null;
+		}
+	}
+	function writeCache(id, pro) {
+		try {
+			sessionStorage.setItem(PLAN_CACHE_KEY, JSON.stringify({ uid: id, pro: !!pro }));
+		} catch (_) {}
+	}
+	function clearCache() {
+		try {
+			sessionStorage.removeItem(PLAN_CACHE_KEY);
+		} catch (_) {}
+	}
+
+	async function refreshPlan(id) {
+		const seq = ++checkSeq;
+		lastCheck = Date.now();
+		const s = await fetchSubscriptionStatus();
+		if (seq !== checkSeq) return; // superseded by a newer check or a logout
+		if (s.error) return;          // transient failure — keep the last known plan
+		if (!s.loggedIn) {
+			isPro = false;
+			clearCache();
+			return;
+		}
+		isPro = !!s.active;
+		writeCache(id, s.active);
+	}
+
+	// Runs whenever the signed-in user changes (login, logout, account switch).
+	$effect(() => {
+		const id = uid;
+		if (!id) {
+			checkSeq++; // cancel any in-flight check
+			isPro = false;
+			return;
+		}
+		const cached = readCache(id);
+		if (cached !== null) isPro = cached;
+		refreshPlan(id);
+	});
+
+	// ---- account menu ---------------------------------------------------------
 	function initials(name) {
 		if (!name) return 'U';
 		const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -24,6 +92,7 @@
 
 	async function handleLogout() {
 		closeMenu();
+		clearCache();
 		await logout(); // store clears tokens, revokes on backend, redirects to /login
 	}
 
@@ -33,15 +102,20 @@
 	function onKeydown(e) {
 		if (e.key === 'Escape') menuOpen = false;
 	}
+	function onFocus() {
+		if (uid && Date.now() - lastCheck > RECHECK_MS) refreshPlan(uid);
+	}
 
 	onMount(() => {
 		// Populate the store from stored tokens (safe to call even if +layout also does).
 		initAuth();
 		document.addEventListener('click', onDocClick);
 		document.addEventListener('keydown', onKeydown);
+		window.addEventListener('focus', onFocus);
 		return () => {
 			document.removeEventListener('click', onDocClick);
 			document.removeEventListener('keydown', onKeydown);
+			window.removeEventListener('focus', onFocus);
 		};
 	});
 </script>
@@ -63,7 +137,9 @@
 		</a>
 
 		<nav class="links" aria-label="Primary">
-			<a href="/pricing">Pricing</a>
+			{#if !isPro}
+				<a href="/pricing">Pricing</a>
+			{/if}
 			<a href="/docs">Documentation</a>
 			<a href="/contact">Contact</a>
 		</nav>

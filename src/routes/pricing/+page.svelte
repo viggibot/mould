@@ -14,21 +14,32 @@
 	let currency = $state(data?.currency ?? 'USD');
 	const symbols = { INR: '₹', USD: '$' };
 
-	// Rust backend base URL — same env var as the rest of the app (was hardcoded).
+	// Rust backend base URL — same env var as the rest of the app.
 	const API_BASE = PUBLIC_API_BASE_URL;
 
 	// ---- auth / subscription -------------------------------------------------
 	// All calls go through authFetch() from the auth store: it refreshes an
-	// expired access token first and retries once on 401. Previously this page
-	// sent the raw stored token — if it had expired (e.g. during a long
-	// checkout), /payment/verify got 401 AFTER the customer had paid.
+	// expired access token first and retries once on 401.
+	//
+	// PRO GATE: an account that is already Pro never sees this page. On load we
+	// check the plan and, if it's active, replace this page with the profile
+	// dashboard. The page is still server-rendered in full (for SEO and for
+	// signed-out visitors); signed-in visitors see a short "Checking your plan"
+	// cover instead, so a Pro user never sees the pricing cards flash first.
 	const LOGIN_PATH = '/login';
 	const SIGNUP_PATH = '/signup';
 	const AFTER_PAYMENT_PATH = '/mould'; // straight into the studio with Pro unlocked
+	const PRO_REDIRECT_PATH = '/profile'; // where Pro accounts land instead of /pricing
+	const GATE_TIMEOUT_MS = 8000;         // never leave the cover up if the check hangs
+
+	// Storage keys written by the auth store — only used to decide whether to
+	// show the cover; the actual session check goes through the store.
+	const SESSION_KEYS = ['akritio_refresh_token', 'akritio_access_token'];
 
 	let loggedIn = $state(false);
 	let alreadyPro = $state(false);
 	let subChecked = $state(false);
+	let planGate = $state(false); // true while a signed-in visitor's plan is being checked
 
 	// Display prices only. The server (akritio_create_order) owns the real amounts.
 	const plans = [
@@ -63,6 +74,14 @@
 		return v === 0 ? 'Free' : `${symbols[currency]}${v}`;
 	}
 
+	function hasStoredSession() {
+		try {
+			return SESSION_KEYS.some((k) => localStorage.getItem(k) || sessionStorage.getItem(k));
+		} catch (_) {
+			return false;
+		}
+	}
+
 	async function checkSubscription() {
 		const s = await fetchSubscriptionStatus();
 		loggedIn = s.loggedIn;
@@ -72,15 +91,33 @@
 	}
 
 	// On load: wait for auth (refreshes an expired token), then learn whether
-	// the visitor is signed in and already Pro, so the Pro card can show
-	// "Current plan" instead of charging again.
+	// the visitor is signed in and already Pro. Pro accounts are sent to the
+	// dashboard (replaceState, so Back doesn't return them here). If the check
+	// fails for a non-auth reason, the page is shown as normal.
 	onMount(() => {
 		let alive = true;
+		planGate = hasStoredSession();
+		const gateTimer = setTimeout(() => {
+			if (alive) planGate = false;
+		}, GATE_TIMEOUT_MS);
+
 		(async () => {
 			await initAuth();
-			if (alive) await checkSubscription();
+			if (!alive) return;
+			const s = await checkSubscription();
+			if (!alive) return;
+			if (!s.error && s.active) {
+				// keep the cover up until the navigation completes
+				goto(PRO_REDIRECT_PATH, { replaceState: true });
+				return;
+			}
+			planGate = false;
 		})();
-		return () => { alive = false; };
+
+		return () => {
+			alive = false;
+			clearTimeout(gateTimer);
+		};
 	});
 
 	// ===== Payment state =====
@@ -266,7 +303,7 @@
 			goto(AFTER_PAYMENT_PATH);
 		} else {
 			const pid = (resp && resp.razorpay_payment_id) || '';
-			payError = `Payment received — we're still confirming it. Open the studio in a minute and Pro will unlock automatically. If it doesn't, email sales@navi3d.in with payment ID ${pid}.`;
+			payError = `Payment received — we're still confirming it. Open the studio in a minute and Pro will unlock automatically. If it doesn't, email sales@akritio.com with payment ID ${pid}.`;
 		}
 	}
 
@@ -405,6 +442,14 @@
 </svelte:head>
 
 <svelte:window onkeydown={modalOpen ? onOverlayKey : undefined} />
+
+<!-- ===== Plan check cover (signed-in visitors only, until we know they're not Pro) ===== -->
+{#if planGate}
+	<div class="plan-gate" role="status" aria-live="polite" out:fade={{ duration: 140 }}>
+		<span class="gate-spin" aria-hidden="true"></span>
+		<p>Checking your plan…</p>
+	</div>
+{/if}
 
 <section class="pricing">
 	<div class="container">
@@ -633,6 +678,36 @@
 {/if}
 
 <style>
+	/* ===== Plan check cover ===== */
+	.plan-gate {
+		position: fixed;
+		inset: 0;
+		z-index: 45; /* below the sticky nav (50) so the header stays visible */
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 14px;
+		background: #fff;
+	}
+	.plan-gate p {
+		margin: 0;
+		font-family: var(--font-mono);
+		font-size: 0.78rem;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+		color: var(--slate-2);
+	}
+	.gate-spin {
+		width: 30px;
+		height: 30px;
+		border: 3px solid var(--line-2);
+		border-top-color: var(--violet);
+		border-radius: 50%;
+		animation: gate-spin 0.8s linear infinite;
+	}
+	@keyframes gate-spin { to { transform: rotate(360deg); } }
+
 	.pricing { padding-block: clamp(48px, 6vw, 90px) var(--space-section); }
 	.head { max-width: 640px; margin: 0 auto clamp(36px, 5vw, 56px); text-align: center; }
 	.eyebrow { margin-inline: auto; }
@@ -751,5 +826,5 @@
 	.m-note { margin: 13px 0 0; font-size: 12px; color: var(--slate); line-height: 1.5; text-align: center; }
 
 	@media (max-width: 420px) { .m-row { flex-direction: column; gap: 0; } }
-	@media (prefers-reduced-motion: reduce) { .cc { transition: none; } .pay-btn.busy::after { animation: none; } }
+	@media (prefers-reduced-motion: reduce) { .cc { transition: none; } .pay-btn.busy::after { animation: none; } .gate-spin { animation: none; } }
 </style>
