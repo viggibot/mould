@@ -1,11 +1,14 @@
 <script>
 	// ==========================================================================
-	// MouldPreview — live 3D preview of the mould.
-	//   • Block: fast bounding-box layout (rectangular mould).
-	//   • Silicone: an ACCURATE offset shell computed in a Web Worker (coarse
-	//     signed-distance field + surface nets — the server pipeline in
-	//     miniature). This follows the real part with no normal-inflation
-	//     spikes, takes ~1s, and never blocks the UI.
+	// MouldPreview — live 3D preview of every Akritio mould system.
+	//   • Two-part box (block): fast bounding-box layout, unchanged — it mirrors
+	//     the server's proven block pipeline (two / four / six-part, open pour).
+	//   • Every other system (adaptive, multi-part, tray, inner core, slip,
+	//     direct open / funnel, skin, fixture, protective shell) is BUILT in a
+	//     Web Worker ($lib/workers/mouldPreview.worker.js): distance field ->
+	//     system SDF -> closed pieces cut along your split planes, with keys,
+	//     clamp holes, base keys, cores, pour funnel, risers and air-trap
+	//     markers. Volumes come back for the live estimate in the inspector.
 	// Requires: npm i three
 	// ==========================================================================
 	import { onMount, onDestroy } from 'svelte';
@@ -14,7 +17,7 @@
 	import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 	import { ThreeMFLoader } from 'three/addons/loaders/3MFLoader.js';
 
-	let { modelBuffer = null, fileName = '', params = {} } = $props();
+	let { modelBuffer = null, fileName = '', params = {}, onStats } = $props();
 
 	let canvasEl, wrapEl;
 	let renderer, scene, camera, controls, raf, ro;
@@ -23,19 +26,49 @@
 	let bbox = null;
 
 	let worker = null;
-	let workerUrl = null;
 	let reqId = 0;
-	let mouldGroup = null; // worker-built silicone mould meshes
-	let pending = null; // debounce timer
-	let lastSig = ''; // signature of geometry-affecting params
+	let systemGroup = null; // worker-built pieces + fill + markers
+	let overlayGroup = null; // block bbox layout
+	let pending = null;
+	let lastSig = '';
 
 	let ready = $state(false);
 	let parseError = $state('');
+	let workerError = $state('');
 	let computing = $state(false);
 	let showOverlay = $state(true);
 	let showPart = $state(true);
+	let showFill = $state(false);
 	let exploded = $state(true);
+	let sectionCut = $state(false);
 	let legendPieces = $state([]);
+	let warnings = $state([]);
+
+	const isBlock = (p) => !p.mould_system || p.mould_system === 'box';
+	let blockNow = $derived(isBlock(params));
+	let hasFillNow = $derived(!blockNow && !['fixture', 'shell'].includes(params.mould_system));
+	let fillLabel = $derived(
+		params.mould_system === 'slip' ? 'Plaster'
+		: ['direct_open', 'direct_funnel'].includes(params.mould_system) ? 'Cast'
+		: params.mould_system === 'skin' ? 'Skin'
+		: params.mould_system === 'core' ? 'Silicone + cast'
+		: 'Silicone'
+	);
+
+	// ---- palette -------------------------------------------------------------
+	const PIECE_COLORS = { a: 0x3b82f6, b: 0x14b8a6, c: 0x8b5cf6, d: 0x06b6d4, top: 0xec4899, bot: 0x22c55e };
+	const SYSTEM_PIECES = [0x3b82f6, 0x14b8a6, 0x8b5cf6, 0x06b6d4, 0xec4899, 0x6366f1, 0xf97316, 0x0ea5e9];
+	const CORE_COLOR = 0xf59e0b;
+	const FILL_COLOR = 0xfbbf24;
+	const MASTER_ADD_COLOR = 0x64748b;
+	const PILLAR_COLOR = 0x22c55e;
+	const TRAP_COLOR = 0xef4444;
+	const KEY_COLOR = 0xd4a017;
+	const clampN = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+	const num = (v, d) => {
+		const x = Number(v);
+		return Number.isFinite(x) ? x : d;
+	};
 
 	function axisVec(a) {
 		if (a === 'x') return new THREE.Vector3(1, 0, 0);
@@ -48,9 +81,7 @@
 		return q;
 	}
 
-	// ---- worker (blob) -------------------------------------------------------
-	const WORKER_SRC = '// ==========================================================================\n// MouldStudio preview worker — builds an ACCURATE mould-shell preview from the\n// part mesh using a coarse signed-distance field + surface nets (the same\n// approach as the server, in miniature). Runs off the main thread so the UI\n// stays responsive; ~1s for a typical part at res 84.\n//\n// Pipeline: surface-voxelize the part -> flood-fill inside/outside -> exact\n// Euclidean distance transform (Felzenszwalb) -> signed field -> compose the\n// mould SDF (offset shell + base plate + open top + nesting pocket) exactly\n// like the backend -> surface-nets mesh. Also emits the silicone envelope.\n//\n// The offset (gap ~12mm) smooths away fine detail, so the output is a clean\n// blob following the part — no spikes, unlike normal-inflation.\n// ==========================================================================\n\n// ---- exact 1D squared-distance transform (lower envelope of parabolas) ----\nfunction edt1d(f, d, n, stride, base) {\n	const v = new Int32Array(n);\n	const z = new Float64Array(n + 1);\n	let k = 0;\n	v[0] = 0;\n	z[0] = -Infinity;\n	z[1] = Infinity;\n	for (let q = 1; q < n; q++) {\n		let s;\n		while (true) {\n			const vk = v[k];\n			s = (f[base + q * stride] + q * q - (f[base + vk * stride] + vk * vk)) / (2 * q - 2 * vk);\n			if (s <= z[k]) k--;\n			else break;\n		}\n		k++;\n		v[k] = q;\n		z[k] = s;\n		z[k + 1] = Infinity;\n	}\n	k = 0;\n	for (let q = 0; q < n; q++) {\n		while (z[k + 1] < q) k++;\n		const vk = v[k];\n		d[q] = (q - vk) * (q - vk) + f[base + vk * stride];\n	}\n}\n\nfunction distanceTransform(field, nx, ny, nz) {\n	// field holds 0 at feature voxels, INF elsewhere; returns sqrt EDT in place\n	const INF = 1e20;\n	const tmp = new Float64Array(Math.max(nx, ny, nz));\n	// X\n	for (let k = 0; k < nz; k++)\n		for (let j = 0; j < ny; j++) {\n			const base = (k * ny + j) * nx;\n			edt1d(field, tmp, nx, 1, base);\n			for (let i = 0; i < nx; i++) field[base + i] = tmp[i];\n		}\n	// Y\n	for (let k = 0; k < nz; k++)\n		for (let i = 0; i < nx; i++) {\n			const base = k * ny * nx + i;\n			edt1d(field, tmp, ny, nx, base);\n			for (let j = 0; j < ny; j++) field[base + j * nx] = tmp[j];\n		}\n	// Z\n	for (let j = 0; j < ny; j++)\n		for (let i = 0; i < nx; i++) {\n			const base = j * nx + i;\n			edt1d(field, tmp, nz, ny * nx, base);\n			for (let k = 0; k < nz; k++) field[base + k * ny * nx] = tmp[k];\n		}\n	for (let n = 0; n < field.length; n++) field[n] = Math.sqrt(field[n]);\n	return field;\n}\n\n// ---- naive but robust surface nets ----------------------------------------\nconst SN_CUBE = [\n	[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],\n	[0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]\n];\nconst SN_EDGES = [\n	[0, 1], [2, 3], [4, 5], [6, 7],\n	[0, 2], [1, 3], [4, 6], [5, 7],\n	[0, 4], [1, 5], [2, 6], [3, 7]\n];\n\nfunction surfaceNets(sdf, nx, ny, nz, h, lo) {\n	const nxy = nx * ny;\n	const vidx = new Int32Array((nx - 1) * (ny - 1) * (nz - 1)).fill(-1);\n	const verts = [];\n	const cidx = (i, j, k) => (k * (ny - 1) + j) * (nx - 1) + i;\n	const val = (i, j, k) => sdf[(k * ny + j) * nx + i];\n	// place one vertex per crossing cell\n	for (let k = 0; k < nz - 1; k++)\n		for (let j = 0; j < ny - 1; j++)\n			for (let i = 0; i < nx - 1; i++) {\n				let mask = 0;\n				const cv = [];\n				for (let c = 0; c < 8; c++) {\n					const v = val(i + SN_CUBE[c][0], j + SN_CUBE[c][1], k + SN_CUBE[c][2]);\n					cv.push(v);\n					if (v < 0) mask |= 1 << c;\n				}\n				if (mask === 0 || mask === 255) continue;\n				let px = 0, py = 0, pz = 0, n = 0;\n				for (const [a, b] of SN_EDGES) {\n					const va = cv[a], vb = cv[b];\n					if ((va < 0) === (vb < 0)) continue;\n					const t = va / (va - vb);\n					px += SN_CUBE[a][0] + t * (SN_CUBE[b][0] - SN_CUBE[a][0]);\n					py += SN_CUBE[a][1] + t * (SN_CUBE[b][1] - SN_CUBE[a][1]);\n					pz += SN_CUBE[a][2] + t * (SN_CUBE[b][2] - SN_CUBE[a][2]);\n					n++;\n				}\n				if (n === 0) continue;\n				vidx[cidx(i, j, k)] = verts.length / 3;\n				verts.push(lo[0] + (i + px / n) * h, lo[1] + (j + py / n) * h, lo[2] + (k + pz / n) * h);\n			}\n	// stitch quads across each sign-changing grid edge (3 principal dirs)\n	const tris = [];\n	const quad = (a, b, c, d, flip) => {\n		if (a < 0 || b < 0 || c < 0 || d < 0) return;\n		if (!flip) { tris.push(a, b, c, a, c, d); }\n		else { tris.push(a, c, b, a, d, c); }\n	};\n	for (let k = 1; k < nz - 1; k++)\n		for (let j = 1; j < ny - 1; j++)\n			for (let i = 1; i < nx - 1; i++) {\n				const s0 = val(i, j, k) < 0;\n				// +X edge\n				if (s0 !== val(i + 1, j, k) < 0) {\n					quad(vidx[cidx(i, j - 1, k - 1)], vidx[cidx(i, j, k - 1)], vidx[cidx(i, j, k)], vidx[cidx(i, j - 1, k)], s0);\n				}\n				// +Y edge\n				if (s0 !== val(i, j + 1, k) < 0) {\n					quad(vidx[cidx(i - 1, j, k - 1)], vidx[cidx(i - 1, j, k)], vidx[cidx(i, j, k)], vidx[cidx(i, j, k - 1)], s0);\n				}\n				// +Z edge\n				if (s0 !== val(i, j, k + 1) < 0) {\n					quad(vidx[cidx(i - 1, j - 1, k)], vidx[cidx(i, j - 1, k)], vidx[cidx(i, j, k)], vidx[cidx(i - 1, j, k)], s0);\n				}\n			}\n	// build non-indexed positions for three.js (with computed normals later)\n	const out = new Float32Array(tris.length * 3);\n	for (let t = 0; t < tris.length; t++) {\n		out[t * 3] = verts[tris[t] * 3];\n		out[t * 3 + 1] = verts[tris[t] * 3 + 1];\n		out[t * 3 + 2] = verts[tris[t] * 3 + 2];\n	}\n	return out;\n}\n\n// ---- main build ------------------------------------------------------------\nfunction buildMould(positions, P, res) {\n	// AABB of the part\n	let mnx = Infinity, mny = Infinity, mnz = Infinity, mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;\n	for (let i = 0; i < positions.length; i += 3) {\n		const x = positions[i], y = positions[i + 1], z = positions[i + 2];\n		if (x < mnx) mnx = x; if (y < mny) mny = y; if (z < mnz) mnz = z;\n		if (x > mxx) mxx = x; if (y > mxy) mxy = y; if (z > mxz) mxz = z;\n	}\n	const gap = P.gap, wall = P.wall, flange = P.flange;\n	const partH = mxz - mnz;\n	const embed = Math.min(Math.max(partH * 0.08, 3), 12);\n	const baseTop = mnz + embed;\n	const baseTh = Math.max(wall * 1.6, 4);\n	const baseBot = mnz - baseTh;\n	const openZ = mxz + Math.min(Math.max(gap * 0.7, 5), 14);\n	const pad = gap + wall + Math.max(flange, 10) + 2;\n	const lo = [mnx - pad, mny - pad, baseBot - 2];\n	const hi = [mxx + pad, mxy + pad, openZ + 3];\n\n	// grid resolution (cap total voxels for speed)\n	const maxdim = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);\n	let h = maxdim / Math.max(24, res);\n	let nx, ny, nz;\n	const dims = () => {\n		nx = Math.ceil((hi[0] - lo[0]) / h) + 3;\n		ny = Math.ceil((hi[1] - lo[1]) / h) + 3;\n		nz = Math.ceil((hi[2] - lo[2]) / h) + 3;\n	};\n	dims();\n	const CAP = 3_000_000;\n	while (nx * ny * nz > CAP) { h *= 1.12; dims(); }\n	const nxy = nx * ny, n = nx * ny * nz;\n\n	// ---- surface voxelization (barycentric sampling seals the shell) --------\n	const occ = new Uint8Array(n);\n	const mark = (x, y, z) => {\n		const i = Math.round((x - lo[0]) / h);\n		const j = Math.round((y - lo[1]) / h);\n		const k = Math.round((z - lo[2]) / h);\n		if (i >= 0 && i < nx && j >= 0 && j < ny && k >= 0 && k < nz) occ[(k * ny + j) * nx + i] = 1;\n	};\n	for (let t = 0; t < positions.length; t += 9) {\n		const ax = positions[t], ay = positions[t + 1], az = positions[t + 2];\n		const bx = positions[t + 3], by = positions[t + 4], bz = positions[t + 5];\n		const cx = positions[t + 6], cy = positions[t + 7], cz = positions[t + 8];\n		const e1 = Math.hypot(bx - ax, by - ay, bz - az);\n		const e2 = Math.hypot(cx - ax, cy - ay, cz - az);\n		const e3 = Math.hypot(cx - bx, cy - by, cz - bz);\n		// sample at <=0.5*voxel spacing so every crossed voxel is marked (seals\n		// the shell for the flood fill — sparse sampling leaks and makes noise)\n		const N = Math.min(64, Math.max(1, Math.ceil(Math.max(e1, e2, e3) / (0.5 * h))));\n		const inv = 1 / N;\n		for (let u = 0; u <= N; u++)\n			for (let vv = 0; vv <= N - u; vv++) {\n				const s = u * inv, tt = vv * inv;\n				mark(ax + (bx - ax) * s + (cx - ax) * tt, ay + (by - ay) * s + (cy - ay) * tt, az + (bz - az) * s + (cz - az) * tt);\n			}\n	}\n\n	// ---- flood fill outside from the grid boundary --------------------------\n	const outside = new Uint8Array(n);\n	const stack = [];\n	const push = (idx) => { if (!outside[idx] && !occ[idx]) { outside[idx] = 1; stack.push(idx); } };\n	for (let k = 0; k < nz; k++)\n		for (let j = 0; j < ny; j++)\n			for (let i = 0; i < nx; i++)\n				if (i === 0 || j === 0 || k === 0 || i === nx - 1 || j === ny - 1 || k === nz - 1)\n					push((k * ny + j) * nx + i);\n	while (stack.length) {\n		const idx = stack.pop();\n		const i = idx % nx, j = ((idx / nx) | 0) % ny, k = (idx / nxy) | 0;\n		if (i > 0) push(idx - 1);\n		if (i < nx - 1) push(idx + 1);\n		if (j > 0) push(idx - nx);\n		if (j < ny - 1) push(idx + nx);\n		if (k > 0) push(idx - nxy);\n		if (k < nz - 1) push(idx + nxy);\n	}\n\n	// ---- signed distance ----------------------------------------------------\n	const INF = 1e20;\n	const df = new Float64Array(n);\n	for (let idx = 0; idx < n; idx++) df[idx] = occ[idx] ? 0 : INF;\n	distanceTransform(df, nx, ny, nz);\n	const sdf = new Float32Array(n);\n	for (let idx = 0; idx < n; idx++) {\n		const d = df[idx] * h;\n		// occ = surface (~0); reachable from boundary = outside (+); else inside (-)\n		sdf[idx] = occ[idx] ? 0 : outside[idx] ? d : -d;\n	}\n\n	// ---- compose the mould + envelope fields (matches the backend) ----------\n	const bx0 = mnx - (gap + wall + flange), bx1 = mxx + (gap + wall + flange);\n	const by0 = mny - (gap + wall + flange), by1 = mxy + (gap + wall + flange);\n	const boxSD = (x, y, z, x0, y0, z0, x1, y1, z1) => {\n		const dx = Math.max(x0 - x, x - x1), dy = Math.max(y0 - y, y - y1), dz = Math.max(z0 - z, z - z1);\n		const ox = Math.max(dx, 0), oy = Math.max(dy, 0), oz = Math.max(dz, 0);\n		return Math.hypot(ox, oy, oz) + Math.min(Math.max(dx, Math.max(dy, dz)), 0);\n	};\n	// XY silhouette (min SDF down the Z column) — for the open pour collar\n	const sil2 = new Float32Array(nx * ny).fill(1e20);\n	for (let k = 0; k < nz; k++)\n		for (let j = 0; j < ny; j++) {\n			const row = (k * ny + j) * nx;\n			const r2 = j * nx;\n			for (let i = 0; i < nx; i++) {\n				const v = sdf[row + i];\n				if (v < sil2[r2 + i]) sil2[r2 + i] = v;\n			}\n		}\n\n	const mould = new Float32Array(n);\n	for (let k = 0; k < nz; k++) {\n		const z = lo[2] + k * h;\n		for (let j = 0; j < ny; j++) {\n			const y = lo[1] + j * h;\n			for (let i = 0; i < nx; i++) {\n				const x = lo[0] + i * h;\n				const s = sdf[(k * ny + j) * nx + i];\n				const sd2 = sil2[j * nx + i];\n				// jacket wall hugging the part, CAPPED at the part top (no dome)\n				// and at the base plate top (no under-wrap bulge below the base)\n				let shell = Math.max(Math.max(s - (gap + wall), gap - s), z - mxz, baseTop - z);\n				// open-centred pour collar above the part (silhouette tube)\n				const collarWall = Math.max(sd2 - (gap + wall), gap - sd2);\n				const collar = Math.max(collarWall, (mxz - wall) - z);\n				let m = Math.min(shell, collar);\n				// base plate\n				const base = boxSD(x, y, z, bx0, by0, baseBot, bx1, by1, baseTop);\n				m = Math.min(m, base);\n				// open top at the pour line\n				m = Math.max(m, z - openZ);\n				// master nesting pocket (carve part below base top)\n				const pocket = Math.max(s - 0.3, z - baseTop);\n				m = Math.max(m, -pocket);\n				mould[(k * ny + j) * nx + i] = m;\n			}\n		}\n	}\n\n	const mouldPos = surfaceNets(mould, nx, ny, nz, h, lo);\n\n	// ---- inner core (rings / tubes / vases) --------------------------------\n	let corePos = new Float32Array(0);\n	if (P.silicone_type === \'core\') {\n		// per-slice void detection: flood the air from each slice border; any\n		// unreached non-solid cell is enclosed by the part at that height\n		const hole = new Uint8Array(n);\n		const reached = new Uint8Array(nx * ny);\n		const st = [];\n		let bx0c = Infinity, by0c = Infinity, bz0c = Infinity, bx1c = -Infinity, by1c = -Infinity, bz1c = -Infinity;\n		let found = false;\n		for (let k = 0; k < nz; k++) {\n			const base = k * nxy;\n			reached.fill(0);\n			st.length = 0;\n			const seed = (i, j) => { const id2 = j * nx + i; if (!reached[id2] && sdf[base + id2] >= 0) { reached[id2] = 1; st.push(id2); } };\n			for (let i = 0; i < nx; i++) { seed(i, 0); seed(i, ny - 1); }\n			for (let j = 0; j < ny; j++) { seed(0, j); seed(nx - 1, j); }\n			while (st.length) {\n				const idx = st.pop();\n				const i = idx % nx, j = (idx / nx) | 0;\n				if (i > 0) seed(i - 1, j);\n				if (i < nx - 1) seed(i + 1, j);\n				if (j > 0) seed(i, j - 1);\n				if (j < ny - 1) seed(i, j + 1);\n			}\n			for (let j = 0; j < ny; j++)\n				for (let i = 0; i < nx; i++) {\n					const id2 = j * nx + i;\n					if (!reached[id2] && sdf[base + id2] >= 0) {\n						hole[base + id2] = 1;\n						found = true;\n						const x = lo[0] + i * h, y = lo[1] + j * h, z = lo[2] + k * h;\n						if (x < bx0c) bx0c = x; if (y < by0c) by0c = y; if (z < bz0c) bz0c = z;\n						if (x > bx1c) bx1c = x; if (y > by1c) by1c = y; if (z > bz1c) bz1c = z;\n					}\n				}\n		}\n		if (found) {\n			const hcx = (bx0c + bx1c) * 0.5, hcy = (by0c + by1c) * 0.5;\n			const span = Math.min(bx1c - bx0c, by1c - by0c);\n			// hand-wheel handle (rim + 3 spokes + hub on a post), like the backend\n			const postR = Math.min(Math.max(span * 0.14, 3), 8);\n			const hubR = Math.max(postR * 1.4, 4.5);\n			const wheelR = Math.min(Math.max(span * 0.55, 12), 42);\n			const rimT = Math.max(wall * 1.1, 3);\n			const spokeW = Math.max(wall * 0.9, 2.5);\n			const gridTop = lo[2] + (nz - 1) * h;\n			const wheelZ = Math.min(bz1c + wall * 2 + rimT + 4, gridTop - rimT - h * 2);\n			const core = new Float32Array(n);\n			for (let k = 0; k < nz; k++) {\n				const z = lo[2] + k * h;\n				for (let j = 0; j < ny; j++) {\n					const y = lo[1] + j * h;\n					for (let i = 0; i < nx; i++) {\n						const x = lo[0] + i * h;\n						const id = (k * ny + j) * nx + i;\n						const s = sdf[id];\n						const erode = gap - s;\n						const mask = hole[id] ? -1 : 1;\n						const zslab = Math.max(bz0c - z, z - bz1c);\n						let c = Math.max(erode, mask, zslab);\n						const dx = x - hcx, dy = y - hcy;\n						const rxy = Math.hypot(dx, dy);\n						const post = Math.max(rxy - postR, Math.max((bz1c - h) - z, z - wheelZ));\n						c = Math.min(c, post);\n						const inplane = Math.abs(z - wheelZ) - rimT;\n						c = Math.min(c, Math.max(rxy - hubR, inplane));\n						const q = rxy - wheelR;\n						c = Math.min(c, Math.sqrt(q * q + (z - wheelZ) * (z - wheelZ)) - rimT);\n						for (let si = 0; si < 3; si++) {\n							const a = si * (2 * Math.PI / 3);\n							const along = dx * Math.cos(a) + dy * Math.sin(a);\n							const perp = -dx * Math.sin(a) + dy * Math.cos(a);\n							const alc = Math.max(0, Math.min(along, wheelR));\n							const dseg = Math.hypot(along - alc, perp);\n							c = Math.min(c, Math.max(dseg - spokeW, inplane));\n						}\n						core[id] = c;\n					}\n				}\n			}\n			corePos = surfaceNets(core, nx, ny, nz, h, lo);\n		}\n	}\n\n	return {\n		mould: mouldPos,\n		envelope: corePos,\n		meta: { baseTop, baseBot, openZ, partTop: mxz, partBot: mnz, nx, ny, nz, h, voxels: n, triCount: mouldPos.length / 9, hasCore: corePos.length > 0 }\n	};\n}\n\nself.onmessage = function (ev) {\n	var d = ev.data;\n	try {\n		var r = buildMould(d.positions, d.params, d.res || 84);\n		self.postMessage({ id: d.id, ok: true, mould: r.mould, envelope: r.envelope, meta: r.meta }, [r.mould.buffer, r.envelope.buffer]);\n	} catch (err) {\n		self.postMessage({ id: d.id, ok: false, error: String((err && err.message) || err) });\n	}\n};\n';
-
+	// ---- scene setup ---------------------------------------------------------
 	onMount(() => {
 		renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: true, alpha: true });
 		renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -62,20 +93,24 @@
 		controls = new OrbitControls(camera, canvasEl);
 		controls.enableDamping = true;
 		controls.dampingFactor = 0.08;
-		scene.add(new THREE.AmbientLight(0xffffff, 0.68));
-		const key = new THREE.DirectionalLight(0xffffff, 0.85);
+		scene.add(new THREE.AmbientLight(0xffffff, 0.62));
+		const key = new THREE.DirectionalLight(0xffffff, 0.9);
 		key.position.set(120, -160, 220);
 		scene.add(key);
-		const fill = new THREE.DirectionalLight(0xffffff, 0.32);
+		const fill = new THREE.DirectionalLight(0xffffff, 0.35);
 		fill.position.set(-140, 120, -60);
 		scene.add(fill);
 
 		try {
-			const blob = new Blob([WORKER_SRC], { type: 'application/javascript' });
-			workerUrl = URL.createObjectURL(blob);
-			worker = new Worker(workerUrl);
+			worker = new Worker(new URL('../workers/mouldPreview.worker.js', import.meta.url), { type: 'module' });
 			worker.onmessage = onWorkerMessage;
+			worker.onerror = (e) => {
+				computing = false;
+				workerError = 'Preview engine failed to start — generation still works.';
+				console.warn('Preview worker error:', e);
+			};
 		} catch (e) {
+			workerError = 'Preview engine unavailable in this browser — generation still works.';
 			console.warn('Preview worker unavailable:', e);
 		}
 
@@ -104,9 +139,9 @@
 		cancelAnimationFrame(raf);
 		if (pending) clearTimeout(pending);
 		if (worker) worker.terminate();
-		if (workerUrl) URL.revokeObjectURL(workerUrl);
 		disposeGroup(partGroup);
-		disposeGroup(mouldGroup);
+		disposeGroup(systemGroup);
+		disposeGroup(overlayGroup);
 		renderer && renderer.dispose();
 	});
 
@@ -121,26 +156,22 @@
 
 	// ---- part loading --------------------------------------------------------
 	function loadPart() {
-		if (!ready || !modelBuffer) {
-			disposeGroup(partGroup);
-			disposeGroup(mouldGroup);
-			partGroup = null;
-			partPositions = null;
-			bbox = null;
-			rebuildOverlay();
-			return;
-		}
 		disposeGroup(partGroup);
-		disposeGroup(mouldGroup);
+		disposeGroup(systemGroup);
 		partGroup = null;
-		mouldGroup = null;
+		systemGroup = null;
 		partPositions = null;
 		bbox = null;
 		parseError = '';
+		warnings = [];
 		lastSig = '';
+		if (!ready || !modelBuffer) {
+			rebuildOverlay();
+			return;
+		}
 		const lower = (fileName || '').toLowerCase();
 		try {
-			const mat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.1, roughness: 0.75 });
+			const mat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.1, roughness: 0.75, side: THREE.DoubleSide });
 			if (lower.endsWith('.stl')) {
 				const geo = new STLLoader().parse(modelBuffer);
 				geo.computeVertexNormals();
@@ -148,10 +179,12 @@
 				partGroup.add(new THREE.Mesh(geo, mat));
 			} else if (lower.endsWith('.3mf')) {
 				const grp = new ThreeMFLoader().parse(modelBuffer);
-				grp.traverse((o) => { if (o.isMesh) o.material = mat; });
+				grp.traverse((o) => {
+					if (o.isMesh) o.material = mat;
+				});
 				partGroup = grp;
 			} else {
-				parseError = 'STEP preview is processed on the server — the layout overlay below still reflects your settings.';
+				parseError = 'STEP files are tessellated on the server — the preview needs an STL or 3MF. Generation still works.';
 			}
 		} catch (e) {
 			parseError = 'Could not preview this file — generation will still work.';
@@ -166,7 +199,6 @@
 		rebuildOverlay();
 	}
 
-	// merge part meshes into a world-space triangle soup (Float32Array)
 	function extractPositions(group) {
 		group.updateWorldMatrix(true, true);
 		const chunks = [];
@@ -184,7 +216,9 @@
 			for (let n = 0; n < count; n++) {
 				const vi = idx ? idx.getX(n) : n;
 				v.set(pos.getX(vi), pos.getY(vi), pos.getZ(vi)).applyMatrix4(m);
-				arr[n * 3] = v.x; arr[n * 3 + 1] = v.y; arr[n * 3 + 2] = v.z;
+				arr[n * 3] = v.x;
+				arr[n * 3 + 1] = v.y;
+				arr[n * 3 + 2] = v.z;
 			}
 			chunks.push(arr);
 			total += arr.length;
@@ -193,7 +227,10 @@
 		if (chunks.length === 1) return chunks[0];
 		const out = new Float32Array(total);
 		let off = 0;
-		for (const c of chunks) { out.set(c, off); off += c.length; }
+		for (const c of chunks) {
+			out.set(c, off);
+			off += c.length;
+		}
 		return out;
 	}
 
@@ -203,216 +240,266 @@
 		const size = bbox.getSize(new THREE.Vector3()).length();
 		controls.target.copy(c);
 		const dir = new THREE.Vector3(1.0, -1.15, 0.85).normalize();
-		camera.position.copy(c.clone().add(dir.multiplyScalar(size * 2.1)));
+		camera.position.copy(c.clone().add(dir.multiplyScalar(size * 2.3)));
 		camera.near = size / 100;
 		camera.far = size * 30;
 		camera.updateProjectionMatrix();
 	}
 
-	// ---- palette + block helpers --------------------------------------------
-	const PIECE_COLORS = { a: 0x3b82f6, b: 0x14b8a6, c: 0x8b5cf6, d: 0x06b6d4, top: 0xec4899, bot: 0x22c55e };
-	const SILICONE_COLOR = 0xf59e0b;
-	const FRAME_COLOR = 0x3b82f6;
-	const KEY_COLOR = 0xd4a017;
-	const clampN = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-
-	function pieceMat(color, opacity = 0.16) {
-		return new THREE.MeshBasicMaterial({ color, transparent: true, opacity, side: THREE.DoubleSide, depthWrite: false });
-	}
-	function pieceEdges(geo, color, opacity = 0.75) {
-		return new THREE.LineSegments(new THREE.EdgesGeometry(geo, 12), new THREE.LineBasicMaterial({ color, transparent: true, opacity }));
-	}
-	function addPiece(parent, geo, color, offset, opacity = 0.16) {
-		const grp = new THREE.Group();
-		grp.add(new THREE.Mesh(geo, pieceMat(color, opacity)));
-		grp.add(pieceEdges(geo, color));
-		if (offset && exploded) grp.position.copy(offset);
-		parent.add(grp);
-	}
-	function clipPoly(poly, nx, ny, k) {
-		const out = [];
-		for (let i = 0; i < poly.length; i++) {
-			const a = poly[i], b = poly[(i + 1) % poly.length];
-			const da = a[0] * nx + a[1] * ny - k, db = b[0] * nx + b[1] * ny - k;
-			if (da >= 0) out.push(a);
-			if ((da >= 0) !== (db >= 0)) { const t = da / (da - db); out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]); }
+	// ---- section view ----------------------------------------------------------
+	function applySection() {
+		if (!renderer) return;
+		if (sectionCut && bbox) {
+			const cy = (bbox.min.y + bbox.max.y) / 2;
+			renderer.clippingPlanes = [new THREE.Plane(new THREE.Vector3(0, 1, 0), -cy)];
+		} else {
+			renderer.clippingPlanes = [];
 		}
-		return out;
-	}
-	function extrudePoly(poly, z0, z1) {
-		const shape = new THREE.Shape();
-		shape.moveTo(poly[0][0], poly[0][1]);
-		for (let i = 1; i < poly.length; i++) shape.lineTo(poly[i][0], poly[i][1]);
-		shape.closePath();
-		const geo = new THREE.ExtrudeGeometry(shape, { depth: z1 - z0, bevelEnabled: false });
-		geo.translate(0, 0, z0);
-		return geo;
 	}
 
 	// ==========================================================================
-	//  Silicone: ask the worker for the accurate mould, render when it returns
+	//  Worker systems
 	// ==========================================================================
-	function siliconeSignature() {
+	// split rows -> world planes through the part centre
+	function planesFromSplits() {
+		if (!bbox) return [];
+		const rows = Array.isArray(params.splits) ? params.splits : [];
+		const c = bbox.getCenter(new THREE.Vector3());
+		return rows.slice(0, 3).map((r) => {
+			const a = (num(r.angle_deg, 0) * Math.PI) / 180;
+			let n;
+			if (r.axis === 'x') n = [Math.cos(a), Math.sin(a), 0];
+			else if (r.axis === 'y') n = [-Math.sin(a), Math.cos(a), 0];
+			else n = [0, -Math.sin(a), Math.cos(a)];
+			const d = n[0] * c.x + n[1] * c.y + n[2] * c.z + num(r.offset_mm, 0);
+			return { n, d };
+		});
+	}
+
+	function workerParams() {
 		const p = params;
-		return [fileName, p.silicone_gap_mm, p.box_wall_mm, p.base_flange_mm, p.parting_axis, p.parting_mode, p.parting_offset_mm, p.silicone_type].join('|');
+		const sys = p.mould_system;
+		const splitCapable = !['fixture'].includes(sys);
+		return {
+			system: sys,
+			gap: num(p.silicone_gap_mm, 12),
+			plaster: num(p.plaster_thickness_mm, 25),
+			cavity_clr: num(p.direct_clearance_mm, 0.3),
+			skin: num(p.skin_thickness_mm, 3),
+			shell_clr: num(p.shell_clearance_mm, 1.5),
+			fixture_clr: num(p.fixture_clearance_mm, 0.4),
+			box_wall: num(p.box_wall_mm, 3),
+			direct_wall: num(p.direct_wall_mm, 3),
+			shell_wall: num(p.shell_wall_mm, 3),
+			base_flange: num(p.base_flange_mm, 8),
+			base_style: p.base_style === 'contour' ? 'contour' : 'rect',
+			base_bolts: !!p.base_bolts,
+			bolt_d: num(p.bolt_diameter_mm, 3.4),
+			flange_t: num(p.flange_thickness_mm, 5),
+			flange_reach: num(p.flange_reach_mm, 10),
+			master_seat: !!p.master_seat,
+			master_clr: num(p.master_clearance_mm, 0.3),
+			master_seal: !!p.master_seal,
+			base_keys: Math.round(num(p.base_key_count, 0)),
+			base_key_d: num(p.base_key_diameter_mm, 6),
+			foundation: num(p.foundation_mm, 0),
+			air_detect: !!p.air_trap_detect,
+			air_pillars: !!p.air_trap_pillars,
+			pillar_d: num(p.pillar_diameter_mm, 3),
+			pour_d: num(p.pour_diameter_mm, 14),
+			pour_top_d: num(p.pour_top_diameter_mm, 24),
+			risers: Math.round(num(p.riser_count, 0)),
+			riser_d: num(p.riser_diameter_mm, 4),
+			key_shape: p.key_shape || 'dome',
+			key_count: Math.round(num(p.split_key_count, 4)),
+			key_d: num(p.key_diameter_mm, 8),
+			key_clr: num(p.key_clearance_mm, 0.2),
+			clamp_holes: !!p.clamp_holes,
+			clamp_d: num(p.clamp_hole_diameter_mm, 3.4),
+			core_mode: p.core_mode || 'auto',
+			cast_wall: num(p.cast_wall_mm, 3),
+			core_draft: num(p.core_draft_deg, 1.5),
+			spare_d: num(p.slip_spare_diameter_mm, 30),
+			spare_h: num(p.slip_spare_height_mm, 25),
+			trim: num(p.top_trim_mm, 0),
+			fixture_depth: num(p.fixture_depth_pct, 40),
+			fixture_margin: num(p.fixture_margin_mm, 8),
+			fixture_base: num(p.fixture_base_mm, 4),
+			planes: splitCapable ? planesFromSplits() : []
+		};
 	}
 
-	function requestSiliconeMould() {
+	function requestSystem() {
 		if (!worker || !partPositions) return;
-		const sig = siliconeSignature();
-		if (sig === lastSig && mouldGroup) return; // already up to date
+		const wp = workerParams();
+		const sig = fileName + '|' + JSON.stringify(wp);
+		if (sig === lastSig && systemGroup) return;
 		lastSig = sig;
 		if (pending) clearTimeout(pending);
 		computing = true;
+		workerError = '';
 		pending = setTimeout(() => {
-			const copy = partPositions.slice(); // keep ours; transfer the copy
+			const copy = partPositions.slice();
 			const id = ++reqId;
-			worker.postMessage(
-				{
-					id,
-					positions: copy,
-					res: partPositions.length > 3_000_000 ? 74 : 88,
-					params: { gap: +params.silicone_gap_mm || 12, wall: +params.box_wall_mm || 3, flange: +params.base_flange_mm || 8, silicone_type: params.silicone_type === 'core' ? 'core' : 'box' }
-				},
-				[copy.buffer]
-			);
-		}, 250);
+			worker.postMessage({ id, positions: copy, res: partPositions.length > 3_000_000 ? 80 : 96, params: wp }, [copy.buffer]);
+		}, 280);
 	}
 
 	function onWorkerMessage(ev) {
 		const d = ev.data;
-		if (d.id !== reqId) return; // stale
+		if (d.id !== reqId) return; // stale result
 		computing = false;
-		if (!d.ok) { console.warn('Preview worker error:', d.error); return; }
-		buildMouldGroup(d);
+		if (!d.ok) {
+			workerError = d.error || 'Preview failed.';
+			warnings = [];
+			disposeGroup(systemGroup);
+			systemGroup = null;
+			onStats?.(null);
+			return;
+		}
+		buildSystemGroup(d);
+		warnings = d.stats.warnings || [];
+		onStats?.(d.stats);
 	}
 
-	function buildMouldGroup(d) {
-		disposeGroup(mouldGroup);
-		mouldGroup = new THREE.Group();
-
-		const p = params;
-		const sa = p.parting_axis === 'x' ? 0 : p.parting_axis === 'y' ? 1 : 2;
-		const twoPart = p.mould_type !== 'one_part';
-		const off = p.parting_mode === 'offset' ? +p.parting_offset_mm || 0 : 0;
-		// split position along the split axis (X/Y at part centre, Z at part mid)
-		const cx = (bbox.min.x + bbox.max.x) / 2, cy = (bbox.min.y + bbox.max.y) / 2;
-		const cz = (d.meta.partBot + d.meta.partTop) / 2;
-		const splitPos = sa === 0 ? cx + off : sa === 1 ? cy + off : cz + off;
-		const sz = bbox.getSize(new THREE.Vector3());
-		const gexp = exploded ? Math.max(6, 0.1 * Math.max(sz.x, sz.y, sz.z)) : 0;
-		const nAxis = axisVec(p.parting_axis);
-		const zDown = new THREE.Vector3(0, 0, -1);
-
-		// mould geometry from the worker (world space, base-down)
+	function geoFrom(arr) {
 		const geo = new THREE.BufferGeometry();
-		geo.setAttribute('position', new THREE.BufferAttribute(d.mould, 3));
+		geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
 		geo.computeVertexNormals();
+		return geo;
+	}
 
-		// Clean, OPAQUE-ish halves with real depth writing — no stacked
-		// translucent double-sided fog (that read as "noise"). A slight
-		// transparency lets the master show through when exploded.
-		const shellMat = (planes) =>
-			new THREE.MeshStandardMaterial({
-				color: FRAME_COLOR,
-				metalness: 0.0,
-				roughness: 0.62,
-				transparent: true,
-				opacity: 0.88,
-				depthWrite: true,
-				side: THREE.DoubleSide,
-				clippingPlanes: planes,
-				clipShadows: false
-			});
-		const edgeMat = new THREE.LineBasicMaterial({ color: 0x1e3a8a, transparent: true, opacity: 0.25 });
+	function buildSystemGroup(d) {
+		disposeGroup(systemGroup);
+		systemGroup = new THREE.Group();
+		const sz = bbox ? bbox.getSize(new THREE.Vector3()) : new THREE.Vector3(50, 50, 50);
+		const maxd = Math.max(sz.x, sz.y, sz.z);
+		let colorIdx = 0;
+		const legend = [];
 
-		if (twoPart) {
-			const planeA = new THREE.Plane(nAxis.clone(), -(splitPos + gexp));
-			const planeB = new THREE.Plane(nAxis.clone().negate(), splitPos - gexp);
-			const a = new THREE.Mesh(geo, shellMat([planeA]));
-			a.position.copy(nAxis.clone().multiplyScalar(gexp));
-			mouldGroup.add(a);
-			const b = new THREE.Mesh(geo, shellMat([planeB]));
-			b.position.copy(nAxis.clone().multiplyScalar(-gexp));
-			mouldGroup.add(b);
-		} else {
-			mouldGroup.add(new THREE.Mesh(geo, shellMat([])));
-		}
-		// crisp silhouette so the shape reads clearly
-		try {
-			const eg = new THREE.EdgesGeometry(geo, 30);
-			mouldGroup.add(new THREE.LineSegments(eg, edgeMat));
-		} catch (e) {}
-
-		// inner core (rings/tubes/vases) — returned in the envelope slot; render
-		// it solid in amber, lifted up when exploded to show it draws out the top
-		let hasCore = false;
-		if (d.envelope && d.envelope.length > 9) {
-			hasCore = true;
-			const cg = new THREE.BufferGeometry();
-			cg.setAttribute('position', new THREE.BufferAttribute(d.envelope, 3));
-			cg.computeVertexNormals();
-			const core = new THREE.Mesh(cg, new THREE.MeshStandardMaterial({ color: SILICONE_COLOR, metalness: 0.0, roughness: 0.55, transparent: true, opacity: 0.95 }));
-			if (exploded) core.position.z += Math.max(10, 0.25 * (bbox.max.z - bbox.min.z));
-			mouldGroup.add(core);
+		for (const p of d.pieces) {
+			if (!p.positions || p.positions.length < 9) continue;
+			let color = SYSTEM_PIECES[colorIdx % SYSTEM_PIECES.length];
+			let opacity = 0.9;
+			if (p.role === 'mould') colorIdx++;
+			else if (p.role === 'core') color = CORE_COLOR;
+			else if (p.role === 'master_add') { color = MASTER_ADD_COLOR; opacity = 1; }
+			else if (p.role === 'pillars') { color = PILLAR_COLOR; opacity = 1; }
+			const mat = new THREE.MeshStandardMaterial({ color, metalness: 0, roughness: 0.6, transparent: opacity < 1, opacity, side: THREE.DoubleSide });
+			const mesh = new THREE.Mesh(geoFrom(p.positions), mat);
+			mesh.userData = { role: p.role, dir: p.dir || [0, 0, 0] };
+			systemGroup.add(mesh);
+			legend.push({ c: color, l: `${p.label} · ${p.vol.toFixed(0)} cm³` });
 		}
 
-		scene.add(mouldGroup);
-		mouldGroup.visible = showOverlay;
+		const FILL_COLORS = { silicone: FILL_COLOR, plaster: 0xe2e8f0, cast: 0x84cc16, skin: 0xf472b6 };
+		const FILL_NAMES = { silicone: 'Silicone', plaster: 'Plaster', cast: 'Cast', skin: 'Skin' };
+		const fillTotals = {};
+		for (const f of d.fills || []) {
+			if (!f.positions || f.positions.length < 9) continue;
+			const color = FILL_COLORS[f.kind] || FILL_COLOR;
+			const split = f.dir && (f.dir[0] || f.dir[1] || f.dir[2]);
+			const fm = new THREE.Mesh(
+				geoFrom(f.positions),
+				new THREE.MeshStandardMaterial({ color, roughness: 0.45, transparent: !split, opacity: split ? 1 : 0.5, depthWrite: !!split, side: THREE.DoubleSide })
+			);
+			fm.userData = { role: 'fill', dir: f.dir || [0, 0, 0] };
+			fm.visible = showFill;
+			systemGroup.add(fm);
+			const label = f.label === f.kind ? FILL_NAMES[f.kind] : f.label;
+			fillTotals[label] = { c: color, v: f.vol, kind: f.kind };
+		}
+		for (const [label, t] of Object.entries(fillTotals))
+			legend.push({ c: t.c, l: `${label} ≈ ${t.v.toFixed(0)} ${t.kind === 'cast' ? 'cm³' : 'ml'}` });
 
-		// legend
-		const axisName = sa === 0 ? 'X' : sa === 1 ? 'Y' : 'Z';
-		const legend = [
-			{ c: FRAME_COLOR, l: `Rigid mould · follows part · wall ${params.box_wall_mm || 3}mm` },
-			{ c: FRAME_COLOR, l: twoPart ? (sa < 2 ? `Vertical clamshell · splits on ${axisName}` : 'Horizontal lid · splits on Z') : 'One-part tray · open top' },
-			{ c: SILICONE_COLOR, l: hasCore ? 'Inner core · plugs the bore (pull handle on top)' : `Silicone gap ${params.silicone_gap_mm || 12}mm (pour region)` }
-		];
-		if (params.silicone_type === 'core' && !hasCore) legend.push({ c: 0x92400e, l: 'No internal void found — jacket only' });
-		if ((+params.base_flange_mm || 0) >= 8) legend.push({ c: FRAME_COLOR, l: 'Base plate + corner bolt holes' });
-		if (twoPart && params.key_shape && params.key_shape !== 'none') legend.push({ c: KEY_COLOR, l: 'Mating-flange keys (server)' });
+		if (d.markers && d.markers.length) {
+			const r = Math.max(1.5, maxd * 0.018);
+			const mg = new THREE.SphereGeometry(r, 16, 12);
+			const mm = new THREE.MeshBasicMaterial({ color: TRAP_COLOR });
+			for (const m of d.markers) {
+				const s = new THREE.Mesh(mg.clone(), mm.clone());
+				s.position.set(m[0], m[1], m[2]);
+				s.userData = { role: 'marker', dir: [0, 0, 0] };
+				systemGroup.add(s);
+			}
+			mg.dispose();
+			mm.dispose();
+			legend.push({ c: TRAP_COLOR, l: `${d.markers.length} air trap${d.markers.length > 1 ? 's' : ''}${params.air_trap_pillars ? ' · pillars added' : ''}` });
+		}
+
+		const st = d.stats;
+		if (st.keys) legend.push({ c: KEY_COLOR, l: `${st.keys} flange keys` });
+		if (st.clamps) legend.push({ c: 0x475569, l: `${st.clamps} clamp / bolt holes` });
+		if (st.base_keys) legend.push({ c: 0x475569, l: `${st.base_keys} base keys` });
+		if (st.risers) legend.push({ c: 0x0ea5e9, l: `Pour funnel + ${st.risers} riser${st.risers > 1 ? 's' : ''}` });
+
+		systemGroup.userData.explode = Math.max(6, 0.12 * maxd);
+		systemGroup.userData.lift = Math.max(12, 0.35 * sz.z);
+		applyExplode();
+		systemGroup.visible = showOverlay;
+		scene.add(systemGroup);
 		legendPieces = legend;
 	}
 
+	function applyExplode() {
+		if (!systemGroup) return;
+		const e = systemGroup.userData.explode || 0;
+		const lift = systemGroup.userData.lift || 0;
+		systemGroup.traverse((o) => {
+			if (!o.isMesh || !o.userData.dir) return;
+			const [dx, dy, dz] = o.userData.dir;
+			if (!exploded) { o.position.set(0, 0, 0); return; }
+			if (o.userData.role === 'core') o.position.set(0, 0, dz ? lift : 0);
+			else if (o.userData.role === 'fill') o.position.set(dx * e * 0.6, dy * e * 0.6, dz * e * 0.6);
+			else o.position.set(dx * e, dy * e, dz * e);
+		});
+	}
+
+	function applyFillVisibility() {
+		if (!systemGroup) return;
+		systemGroup.traverse((o) => {
+			if (o.userData && o.userData.role === 'fill') o.visible = showFill;
+		});
+	}
+
 	// ==========================================================================
-	//  Overlay rebuild (block bbox layout + trigger silicone worker)
+	//  Overlay rebuild (block bbox layout OR trigger the worker)
 	// ==========================================================================
-	let overlayGroup = null;
 	function rebuildOverlay() {
 		if (!ready) return;
 		disposeGroup(overlayGroup);
-		overlayGroup = new THREE.Group();
-		const legend = [];
+		overlayGroup = null;
 		const p = params || {};
-		const type = p.mould_type || 'two_part';
-		const radial = type === 'four_part' || type === 'six_part';
-		const style = p.mould_style || 'block';
-		const isSil = style === 'silicone_box' && !radial;
 
-		if (!bbox || !showOverlay) {
-			if (mouldGroup) mouldGroup.visible = showOverlay && isSil;
-			scene.add(overlayGroup);
-			legendPieces = isSil && mouldGroup ? legendPieces : legend;
-			return;
-		}
-
-		if (isSil) {
-			// the accurate mould comes from the worker; clear stale block overlay
-			scene.add(overlayGroup);
-			if (mouldGroup) mouldGroup.visible = true;
-			requestSiliconeMould();
+		if (!isBlock(p)) {
+			if (systemGroup) systemGroup.visible = showOverlay;
+			if (bbox && showOverlay) requestSystem();
 			return;
 		}
 
 		// ---------- BLOCK / RADIAL (fast bbox layout) ----------
-		if (mouldGroup) { disposeGroup(mouldGroup); mouldGroup = null; }
+		if (systemGroup) {
+			disposeGroup(systemGroup);
+			systemGroup = null;
+			lastSig = '';
+		}
+		warnings = [];
+		onStats?.(null);
+		overlayGroup = new THREE.Group();
+		const legend = [];
+		if (!bbox || !showOverlay) {
+			scene.add(overlayGroup);
+			legendPieces = legend;
+			return;
+		}
+		const type = p.mould_type || 'two_part';
 		const axis = p.parting_axis || 'z';
 		const q = axisQuat(axis);
 		const inv = q.clone().invert();
 		const corners = [];
 		for (const x of [bbox.min.x, bbox.max.x])
 			for (const y of [bbox.min.y, bbox.max.y])
-				for (const z of [bbox.min.z, bbox.max.z])
-					corners.push(new THREE.Vector3(x, y, z).applyQuaternion(inv));
+				for (const z of [bbox.min.z, bbox.max.z]) corners.push(new THREE.Vector3(x, y, z).applyQuaternion(inv));
 		const lb = new THREE.Box3().setFromPoints(corners);
 		const clr = +p.cavity_clearance_mm || 0;
 		const wall = +p.wall_thickness_mm || 8;
@@ -444,7 +531,7 @@
 			const capTop = six ? lb.max.z - partH * 0.22 : bmax.z;
 			const dirs = [[1, 0], [0, 1], [-1, 0], [0, -1]];
 			const cols = [PIECE_COLORS.a, PIECE_COLORS.b, PIECE_COLORS.c, PIECE_COLORS.d];
-			const names = ['+X wedge', '+Y wedge', '\u2212X wedge', '\u2212Y wedge'];
+			const names = ['+X wedge', '+Y wedge', '−X wedge', '−Y wedge'];
 			for (let idx = 0; idx < 4; idx++) {
 				const dd = dirs[idx];
 				let poly = rect.map((pt) => [pt[0] - pc.x, pt[1] - pc.y]);
@@ -463,7 +550,6 @@
 			}
 		}
 
-		// sprue (block only)
 		const gate = p.gate_type || 'top';
 		if (type !== 'one_part' && gate !== 'none') {
 			const sr = Math.max(0.5, (+p.sprue_diameter_mm || 6) * 0.5);
@@ -475,27 +561,22 @@
 			sprue.rotation.x = Math.PI / 2;
 			sprue.position.set(sx, sy, (zTop + zLand) / 2);
 			local.add(sprue);
-			legend.push({ c: 0x0ea5e9, l: `Sprue \u00d8${p.sprue_diameter_mm || 6}` });
+			legend.push({ c: 0x0ea5e9, l: `Sprue Ø${p.sprue_diameter_mm || 6}` });
 		}
 
-		// keys (block)
-		if (p.key_shape && p.key_shape !== 'none' && type !== 'one_part') {
+		if (p.key_shape && p.key_shape !== 'none' && type === 'two_part') {
 			const kr = Math.max(1, (+p.key_diameter_mm || 8) * 0.5);
 			const keyMat = new THREE.MeshBasicMaterial({ color: KEY_COLOR, transparent: true, opacity: 0.9 });
-			const addKey = (x, y, z, dz = 0) => {
+			let pz = p.parting_mode === 'offset' ? pc.z + (+p.parting_offset_mm || 0) : pc.z;
+			pz = clampN(pz, lb.min.z, lb.max.z);
+			const roK = clr + wall * 0.5, d7 = roK * 0.707;
+			const pts = [[lb.max.x + d7, lb.max.y + d7], [lb.min.x - d7, lb.min.y - d7], [lb.max.x + d7, lb.min.y - d7], [lb.min.x - d7, lb.max.y + d7], [pc.x, lb.max.y + roK], [pc.x, lb.min.y - roK]].slice(0, Math.max(2, Math.min(6, +p.key_count || 4)));
+			for (const [x, y] of pts) {
 				const s = new THREE.Mesh(new THREE.SphereGeometry(kr, 16, 12), keyMat);
-				s.position.set(x, y, z + dz);
+				s.position.set(x, y, pz - gap);
 				local.add(s);
-			};
-			let count = 0;
-			if (type === 'two_part') {
-				let pz = p.parting_mode === 'offset' ? pc.z + (+p.parting_offset_mm || 0) : pc.z;
-				pz = clampN(pz, lb.min.z, lb.max.z);
-				const roK = clr + wall * 0.5, d7 = roK * 0.707;
-				const pts = [[lb.max.x + d7, lb.max.y + d7], [lb.min.x - d7, lb.min.y - d7], [lb.max.x + d7, lb.min.y - d7], [lb.min.x - d7, lb.max.y + d7]].slice(0, Math.max(2, Math.min(6, +p.key_count || 4)));
-				for (const [x, y] of pts) { addKey(x, y, pz, -gap); count++; }
 			}
-			if (count) legend.push({ c: KEY_COLOR, l: `${count} registration keys \u00d8${p.key_diameter_mm || 8}` });
+			legend.push({ c: KEY_COLOR, l: `${pts.length} registration keys Ø${p.key_diameter_mm || 8}` });
 		}
 
 		local.quaternion.copy(q);
@@ -504,25 +585,92 @@
 		legendPieces = legend;
 	}
 
-	function toHex(c) { return c.toString(16).padStart(6, '0'); }
+	function pieceMat(color, opacity = 0.16) {
+		return new THREE.MeshBasicMaterial({ color, transparent: true, opacity, side: THREE.DoubleSide, depthWrite: false });
+	}
+	function pieceEdges(geo, color, opacity = 0.75) {
+		return new THREE.LineSegments(new THREE.EdgesGeometry(geo, 12), new THREE.LineBasicMaterial({ color, transparent: true, opacity }));
+	}
+	function addPiece(parent, geo, color, offset, opacity = 0.16) {
+		const grp = new THREE.Group();
+		grp.add(new THREE.Mesh(geo, pieceMat(color, opacity)));
+		grp.add(pieceEdges(geo, color));
+		if (offset && exploded) grp.position.copy(offset);
+		parent.add(grp);
+	}
+	function clipPoly(poly, nx, ny, k) {
+		const out = [];
+		for (let i = 0; i < poly.length; i++) {
+			const a = poly[i], b = poly[(i + 1) % poly.length];
+			const da = a[0] * nx + a[1] * ny - k, db = b[0] * nx + b[1] * ny - k;
+			if (da >= 0) out.push(a);
+			if (da >= 0 !== db >= 0) {
+				const t = da / (da - db);
+				out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+			}
+		}
+		return out;
+	}
+	function extrudePoly(poly, z0, z1) {
+		const shape = new THREE.Shape();
+		shape.moveTo(poly[0][0], poly[0][1]);
+		for (let i = 1; i < poly.length; i++) shape.lineTo(poly[i][0], poly[i][1]);
+		shape.closePath();
+		const geo = new THREE.ExtrudeGeometry(shape, { depth: z1 - z0, bevelEnabled: false });
+		geo.translate(0, 0, z0);
+		return geo;
+	}
+
+	function toHex(c) {
+		return c.toString(16).padStart(6, '0');
+	}
 
 	// ---- reactivity ----------------------------------------------------------
-	$effect(() => { modelBuffer; fileName; if (ready) loadPart(); });
+	let paramSig = $derived(JSON.stringify(params));
 	$effect(() => {
-		params.mould_type; params.mould_style; params.parting_axis; params.parting_mode; params.parting_offset_mm;
-		params.wall_thickness_mm; params.cavity_clearance_mm; params.silicone_gap_mm; params.box_wall_mm;
-		params.base_flange_mm; params.flange_thickness_mm; params.flange_reach_mm; params.master_seat; params.master_clearance_mm; params.silicone_type;
-		params.gate_type; params.sprue_type; params.sprue_diameter_mm; params.sprue_offset_x_mm; params.sprue_offset_y_mm;
-		params.key_shape; params.key_count; params.key_diameter_mm;
-		showOverlay; exploded;
+		modelBuffer;
+		fileName;
+		if (ready) loadPart();
+	});
+	$effect(() => {
+		paramSig;
+		showOverlay;
 		if (ready) rebuildOverlay();
 	});
-	$effect(() => { if (partGroup) partGroup.visible = showPart; });
-	$effect(() => { if (mouldGroup) mouldGroup.visible = showOverlay; });
+	$effect(() => {
+		exploded;
+		if (!ready) return;
+		if (blockNow) rebuildOverlay();
+		else applyExplode();
+	});
+	$effect(() => {
+		showFill;
+		applyFillVisibility();
+	});
+	$effect(() => {
+		sectionCut;
+		if (ready) applySection();
+	});
+	$effect(() => {
+		if (partGroup) partGroup.visible = showPart;
+	});
+	$effect(() => {
+		if (systemGroup) systemGroup.visible = showOverlay;
+	});
 
-	function toggleExploded() { exploded = !exploded; if (mouldGroup && (params.mould_style === 'silicone_box')) { lastSig = ''; rebuildOverlay(); } }
-
-	let isSilNow = $derived(params.mould_style === 'silicone_box' && params.mould_type !== 'four_part' && params.mould_type !== 'six_part');
+	const NOTES = {
+		box: 'Live layout preview. Cavity sweeps, undercut relief and optimised parting planes are computed on the server.',
+		adaptive: 'Shape-following jacket built from a distance field. Split planes, flange keys, clamp holes, base keys and pour funnel are real geometry.',
+		multipart: 'Jacket and silicone are both cut on every split plane; silicone pieces get round natches. Toggle “Silicone” to see them.',
+		core: 'Vessels: the jacket stays open at the mouth and a drafted core with a T-bar drops in to hollow the cast. Bores (rings, tubes) are plugged instead. Toggle “Silicone + cast” to see the hollow cast.',
+		slip: 'Open-top case for pouring the plaster mould — the gap is the plaster wall. Toggle “Plaster” to see the keyed plaster pieces; the spare forms the pour opening.',
+		tray: 'One-piece open tray. The master nests in the base; silicone is poured over the top.',
+		direct_open: 'Rigid mould you cast straight into. The base is open — flip it and pour.',
+		direct_funnel: 'Closed rigid mould with a top funnel and risers at the high points.',
+		skin: 'Printed core (master + base) and an outer shell; the gap between them forms the skin.',
+		fixture: 'Holder block with a drop-in pocket swept straight up so the part lifts out, plus finger notches.',
+		shell: 'Fitted clamshell case with mating flange and keys.'
+	};
 </script>
 
 <div class="preview" bind:this={wrapEl}>
@@ -531,8 +679,12 @@
 	<div class="pv-toolbar">
 		<button type="button" class="pv-btn" onclick={fitView} title="Fit view">⤢ Fit</button>
 		<button type="button" class="pv-btn {showOverlay ? 'on' : ''}" onclick={() => (showOverlay = !showOverlay)}>Mould</button>
-		<button type="button" class="pv-btn {showPart ? 'on' : ''}" onclick={() => (showPart = !showPart)}>{isSilNow ? 'Master' : 'Part'}</button>
-		<button type="button" class="pv-btn {exploded ? 'on' : ''}" onclick={toggleExploded}>Exploded</button>
+		<button type="button" class="pv-btn {showPart ? 'on' : ''}" onclick={() => (showPart = !showPart)}>{blockNow ? 'Part' : 'Master'}</button>
+		{#if hasFillNow}
+			<button type="button" class="pv-btn {showFill ? 'on' : ''}" onclick={() => (showFill = !showFill)}>{fillLabel}</button>
+		{/if}
+		<button type="button" class="pv-btn {exploded ? 'on' : ''}" onclick={() => (exploded = !exploded)}>Exploded</button>
+		<button type="button" class="pv-btn {sectionCut ? 'on' : ''}" onclick={() => (sectionCut = !sectionCut)} title="Cut the view in half to see inside">Section</button>
 	</div>
 
 	{#if computing}
@@ -547,25 +699,35 @@
 
 	{#if parseError}
 		<p class="pv-note">{parseError}</p>
+	{:else if workerError}
+		<p class="pv-note warn">{workerError}</p>
+	{:else if warnings.length}
+		<p class="pv-note warn">{warnings.join(' ')}</p>
 	{:else}
-		<p class="pv-note">
-			{#if isSilNow}Accurate offset-shell preview (computed with a distance field, like the server). Exact flange, keys and pour collar are on the server.{:else}Live layout preview from your settings. Cavity sweeps, undercut relief and optimised planes are computed on the server.{/if}
-		</p>
+		<p class="pv-note">{NOTES[params.mould_system || 'box'] || NOTES.box}</p>
 	{/if}
 </div>
 
 <style>
-	.preview { position: relative; width: 100%; height: 100%; overflow: hidden; background: radial-gradient(ellipse at 30% 20%, #f8fafc 0%, #eef2f7 100%); }
+	.preview { position: relative; width: 100%; height: 100%; overflow: hidden; background: #eef2f7; }
 	canvas { display: block; width: 100%; height: 100%; }
-	.pv-toolbar { position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; }
-	.pv-btn { font-family: inherit; font-size: 11.5px; font-weight: 600; color: #475569; background: rgba(255,255,255,0.9); border: 1px solid #e2e8f0; border-radius: 999px; padding: 6px 12px; cursor: pointer; backdrop-filter: blur(4px); transition: border-color .15s, color .15s; }
+	.pv-toolbar { position: absolute; top: 12px; left: 12px; right: 190px; display: flex; flex-wrap: wrap; gap: 6px; }
+	.pv-btn { font-family: inherit; font-size: 11.5px; font-weight: 600; color: #475569; background: rgba(255, 255, 255, 0.92); border: 1px solid #e2e8f0; border-radius: 999px; padding: 6px 12px; cursor: pointer; transition: border-color 0.15s, color 0.15s; }
 	.pv-btn:hover { border-color: #cbd5e1; }
 	.pv-btn.on { color: #6d28d9; border-color: #ddd6fe; background: #f5f3ff; }
-	.pv-computing { position: absolute; top: 12px; right: 12px; display: flex; align-items: center; gap: 7px; font-size: 11.5px; font-weight: 600; color: #6d28d9; background: rgba(245,243,255,0.92); border: 1px solid #ddd6fe; border-radius: 999px; padding: 6px 12px; backdrop-filter: blur(4px); }
+	.pv-computing { position: absolute; top: 12px; right: 12px; display: flex; align-items: center; gap: 7px; font-size: 11.5px; font-weight: 600; color: #6d28d9; background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 999px; padding: 6px 12px; }
 	.spin { width: 11px; height: 11px; border: 2px solid #ddd6fe; border-top-color: #6d28d9; border-radius: 50%; display: inline-block; animation: spin 0.7s linear infinite; }
 	@keyframes spin { to { transform: rotate(360deg); } }
-	.pv-legend { position: absolute; bottom: 42px; left: 12px; right: 12px; display: flex; flex-wrap: wrap; gap: 6px; }
-	.chip { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; font-weight: 600; color: #475569; background: rgba(255,255,255,0.85); border: 1px solid #e2e8f0; border-radius: 999px; padding: 3px 9px; }
+	.pv-legend { position: absolute; bottom: 46px; left: 12px; right: 12px; display: flex; flex-wrap: wrap; gap: 6px; pointer-events: none; }
+	.chip { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; font-weight: 600; color: #475569; background: rgba(255, 255, 255, 0.9); border: 1px solid #e2e8f0; border-radius: 999px; padding: 3px 9px; }
 	.chip i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
-	.pv-note { position: absolute; bottom: 0; left: 0; right: 0; margin: 0; padding: 8px 12px; font-size: 11.5px; color: #64748b; background: rgba(255,255,255,0.82); border-top: 1px solid #eef2f7; backdrop-filter: blur(4px); }
+	.pv-note { position: absolute; bottom: 0; left: 0; right: 0; margin: 0; padding: 8px 12px; font-size: 11.5px; line-height: 1.45; color: #64748b; background: rgba(255, 255, 255, 0.92); border-top: 1px solid #e2e8f0; }
+	.pv-note.warn { color: #92400e; background: #fffbeb; border-top-color: #fde68a; }
+	@media (max-width: 720px) {
+		.pv-toolbar { right: 12px; }
+		.pv-computing { top: auto; bottom: 90px; }
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.spin { animation: none; }
+	}
 </style>

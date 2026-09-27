@@ -2,24 +2,35 @@
 	// ==========================================================================
 	// MOULD STUDIO — full-screen design studio for the mould generator.
 	//
-	// ACCESS FLOW:
-	//   • Generation REQUIRES login — every request goes through authFetch()
-	//     from the auth store, which refreshes an expired access token first and
-	//     retries once on 401. (Previously this page read the raw token from
-	//     storage on mount — BEFORE the layout's initAuth() had refreshed it —
-	//     so the plan check got 401 and Pro options stayed locked for paying
-	//     users.)
-	//   • The plan is (re)checked on mount AFTER initAuth(), whenever the tab
-	//     regains focus (e.g. back from paying in another tab), and after any
-	//     402 from the server — if the account turns out to be Pro, the
-	//     generation is retried automatically.
-	//   • Premium options are locked in the UI for free accounts and routed to
-	//     /pricing: silicone mould types, four/six-part, Fine/Custom voxel,
-	//     CAD-exact precision. The backend enforces the same set (402).
+	// MOULD SYSTEMS (params.mould_system):
+	//   box            Two-part box — rigid block, two / four / six-part, open pour
+	//   adaptive       Adapted box — shape-following rigid jacket for silicone
+	//   tray           Tray box — one-piece open tray for flat-backed parts
+	//   multipart      Multi-part silicone — jacket split on 2–3 planes
+	//   core           Inner cavity — jacket + pull-out core (plug a bore / hollow a vessel)
+	//   slip           Slip casting — plaster-mould jacket, spare + top trim
+	//   direct_open    Direct mould · open base — rigid mould you cast straight into
+	//   direct_funnel  Direct mould · top funnel — closed rigid mould + funnel + risers
+	//   skin           Printed mould · skin — printed core + outer shell for latex/silicone skins
+	//   fixture        Fixture — holder block with drop-in pocket
+	//   shell          Protective shell — fitted clamshell case
+	//
+	// Every system previews live (MouldPreview + its worker). Generation posts
+	// the same params to the backend; `mould_system` is new, and `mould_style`
+	// / `silicone_type` / `mould_type` are still sent in the old shape for the
+	// systems the current server already understands (box, adaptive, tray,
+	// core). See SERVER_SYSTEMS.
+	//
+	// ACCESS FLOW (unchanged):
+	//   • Generation REQUIRES login — every request goes through authFetch().
+	//   • The plan is (re)checked on mount AFTER initAuth(), on tab focus, and
+	//     after any 402; if the account is actually Pro the request is retried.
+	//   • Premium options are locked in the UI for free accounts (all systems
+	//     except the two-part box, four/six-part, Fine/Custom voxel, CAD-exact).
 	//   • Free accounts get 1 mould/day; the backend returns 429.
 	//
 	// Param names still match the backend MouldParams serde contract exactly
-	// (snake_case, `mould_type` / `mould_style`). Do not rename them.
+	// (snake_case). Do not rename existing ones.
 	// ==========================================================================
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$env/static/public';
@@ -31,14 +42,16 @@
 	const MAX_UPLOAD_MB = 200;
 	const ACCEPT = ['.stl', '.step', '.stp', '.3mf'];
 
+	// Systems the backend generates (mould_systems.rs + the block pipeline).
+	// Keep in sync with the server if a system is ever disabled there.
+	const SERVER_SYSTEMS = new Set(['box', 'adaptive', 'tray', 'multipart', 'core', 'slip', 'direct_open', 'direct_funnel', 'skin', 'fixture', 'shell']);
+
 	// ---- access / subscription config --------------------------------------
 	const LOGIN_PATH = '/login';
 	const PRICING_PATH = '/pricing';
-	const SUB_RECHECK_MS = 10_000; // min gap between focus-triggered plan checks
+	const SUB_RECHECK_MS = 10_000;
 
 	// ---- shared file state (hosted by the studio shell) --------------------
-	// Works standalone too: local state is the fallback when no shell props
-	// are supplied; setShared() keeps the shell (STL editor) in sync.
 	let {
 		file: fileProp = null,
 		modelBuffer: bufferProp = null,
@@ -58,15 +71,17 @@
 	}
 
 	let fileError = $state('');
+	// live estimate from the preview worker
+	let previewStats = $state(null);
 	let dragOver = $state(false);
 	let fileInputEl;
 
 	// ---- access state -------------------------------------------------------
 	let loggedIn = $state(false);
 	let isPremium = $state(false);
-	let subChecked = $state(false); // becomes true once status is known
-	let subError = $state('');      // plan check failed for a non-auth reason
-	let showUpgrade = $state(false); // toggled by 402 / 429 responses
+	let subChecked = $state(false);
+	let subError = $state('');
+	let showUpgrade = $state(false);
 	let lastSubCheck = 0;
 
 	function goLogin() {
@@ -76,9 +91,6 @@
 		if (typeof window !== 'undefined') window.location.assign(PRICING_PATH);
 	}
 
-	// Ask the server whether this account is Pro. On a transient failure the
-	// previous plan state is KEPT, so a paying user is never downgraded to Free
-	// just because one request failed.
 	async function checkSubscription(force = false) {
 		const now = Date.now();
 		if (!force && now - lastSubCheck < SUB_RECHECK_MS) return;
@@ -95,19 +107,99 @@
 		subChecked = true;
 	}
 
+	// ---- mould systems --------------------------------------------------------
+	const FAMILY = {
+		box: 'block',
+		adaptive: 'silicone',
+		multipart: 'silicone',
+		core: 'silicone',
+		slip: 'silicone',
+		tray: 'tray',
+		direct_open: 'direct_open',
+		direct_funnel: 'direct_funnel',
+		skin: 'skin',
+		fixture: 'fixture',
+		shell: 'shell'
+	};
+	const SPLIT_X = { axis: 'x', offset_mm: 0, angle_deg: 0 };
+	const SPLIT_Y = { axis: 'y', offset_mm: 0, angle_deg: 0 };
+	const SPLIT_Z = { axis: 'z', offset_mm: 0, angle_deg: 0 };
+
+	const SYSTEMS = [
+		{
+			id: 'box', group: 'Rigid', title: 'Two-part box', tags: ['Candles', 'Soap', 'Wax'], splits: [],
+			hint: 'A solid rigid block split into halves (or four / six radial pieces). Cast plaster, wax or soap straight into it — no silicone needed.',
+			svg: '<rect x="4" y="7" width="9" height="20" rx="1.5"/><rect x="19" y="7" width="9" height="20" rx="1.5"/>'
+		},
+		{
+			id: 'adaptive', group: 'Silicone', title: 'Adapted box', tags: ['Figures', 'Resin', 'Detail'], splits: [SPLIT_X],
+			hint: 'The everyday silicone system. A thin rigid jacket follows the master at an even gap, split into two, with a base plate, pour funnel, risers and bolt-on flange. Pour silicone into the gap, cure, peel off a reusable negative.',
+			svg: '<path d="M16 5 C9 5 6 10 6 16 C6 23 10 27 16 27" fill="none" stroke-width="2.4"/><path d="M16 5 C23 5 26 10 26 16 C26 23 22 27 16 27" fill="none" stroke-width="2.4"/>'
+		},
+		{
+			id: 'tray', group: 'Silicone', title: 'Tray box', tags: ['Reliefs', 'Coins', 'Tiles'], splits: [],
+			hint: 'An open one-piece tray for flat-backed masters. The master nests in the base; silicone is poured over the top in a single pour.',
+			svg: '<path d="M5 12 h22 v11 a2 2 0 0 1 -2 2 h-18 a2 2 0 0 1 -2 -2 z" fill="none" stroke-width="2.2"/><ellipse cx="16" cy="12" rx="11" ry="3"/>'
+		},
+		{
+			id: 'multipart', group: 'Silicone', title: 'Multi-part silicone', tags: ['Busts', 'Complex', 'Undercuts'], splits: [SPLIT_X, SPLIT_Y],
+			hint: 'An enclosed jacket cut on two or three planes you control, for forms that need defined parting lines. The silicone is cut on the same planes into keyed pieces (round natches), and every jacket piece gets flange keys and clamp holes.',
+			svg: '<path d="M14 4a12 12 0 0 0-10 10h10z M18 4a12 12 0 0 1 10 10H18z M4 18a12 12 0 0 0 10 10V18z M28 18a12 12 0 0 1-10 10V18z" fill="none" stroke-width="2"/>'
+		},
+		{
+			id: 'core', group: 'Silicone', title: 'Inner cavity', tags: ['Vases', 'Planters', 'Rings'], splits: [SPLIT_X],
+			hint: 'For hollow casts and vessels. The jacket stays open at the mouth, and a shape-adapted, drafted core with a T-bar drops in and rests across the rim, so the cast comes out hollow at your wall thickness. Masters with a bore (rings, tubes) get the bore plugged instead. No manual core modelling.',
+			svg: '<path d="M8 8 v14 a8 8 0 0 0 16 0 v-14" fill="none" stroke-width="2.2"/><ellipse cx="16" cy="8" rx="8" ry="2.6"/><circle cx="16" cy="15" r="4.5" fill="none" stroke-width="2"/>'
+		},
+		{
+			id: 'slip', group: 'Ceramics', title: 'Slip casting', tags: ['Ceramics', 'Plaster', 'Slip'], splits: [SPLIT_X],
+			hint: 'Builds the open-top case for pouring a plaster mould. The gap is the plaster wall; the master gets a shape-matched spare (pour reservoir) on top and an optional flat top trim. Pour one half at a time against the split — the plaster pieces come out keyed with natches.',
+			svg: '<path d="M9 9h14l-2 16a3 3 0 0 1-3 2h-4a3 3 0 0 1-3-2z" fill="none" stroke-width="2"/><path d="M12 4h8v5h-8z" fill="none" stroke-width="2"/>'
+		},
+		{
+			id: 'direct_open', group: 'Direct print', title: 'Direct · open base', tags: ['Resin', 'Wax', 'Plaster'], splits: [SPLIT_X],
+			hint: 'A rigid printed mould you cast straight into — no silicone. The base is open for easy pouring and extraction, with a stable wing to stand it on.',
+			svg: '<path d="M6 27V13a10 10 0 0 1 20 0v14" fill="none" stroke-width="2.4"/><path d="M11 27V14a5 5 0 0 1 10 0v13" fill="none" stroke-width="1.6"/>'
+		},
+		{
+			id: 'direct_funnel', group: 'Direct print', title: 'Direct · top funnel', tags: ['Resin', 'Concrete', 'Jesmonite'], splits: [SPLIT_X],
+			hint: 'A closed rigid printed mould with an integrated top funnel and risers at the high points for a controlled fill.',
+			svg: '<path d="M6 17a10 9 0 0 0 20 0a10 9 0 0 0-20 0z" fill="none" stroke-width="2.2"/><path d="M11 3h10l-3 6h-4z" fill="none" stroke-width="2"/><line x1="16" y1="9" x2="16" y2="8" stroke-width="2"/>'
+		},
+		{
+			id: 'skin', group: 'Direct print', title: 'Printed mould · skin', tags: ['Masks', 'Latex', 'Prosthetics'], splits: [],
+			hint: 'Prints a core (your master on a base) and a matching outer shell. The even gap between them forms a flexible latex or silicone skin.',
+			svg: '<path d="M8 6c5-2 11-2 16 0v9c0 7-4 12-8 12s-8-5-8-12z" fill="none" stroke-width="2.2"/><circle cx="12.5" cy="13" r="1.8"/><circle cx="19.5" cy="13" r="1.8"/>'
+		},
+		{
+			id: 'fixture', group: 'Utility', title: 'Fixture', tags: ['Pad print', 'Painting', 'Engraving'], splits: [],
+			hint: 'A holder that grips the part for pad printing, soldering, painting or engraving. The pocket is swept straight up so the part drops in and lifts out.',
+			svg: '<rect x="3" y="17" width="26" height="9" rx="2" fill="none" stroke-width="2.2"/><path d="M10 17a6 6 0 0 1 12 0" fill="none" stroke-width="2"/>'
+		},
+		{
+			id: 'shell', group: 'Utility', title: 'Protective shell', tags: ['Shipping', 'Storage', 'Gifts'], splits: [SPLIT_X],
+			hint: 'A fitted clamshell case that keeps delicate models safe in shipping and storage, with keyed halves.',
+			svg: '<rect x="5" y="4" width="22" height="24" rx="6" fill="none" stroke-width="2.2"/><line x1="5" y1="16" x2="27" y2="16" stroke-width="2"/>'
+		}
+	];
+	const SYSTEM_BY_ID = Object.fromEntries(SYSTEMS.map((s) => [s.id, s]));
+
 	// ---- which options are Pro-only (mirrors backend premium_features_used) --
-	const PREMIUM_CARDS = new Set(['adaptive', 'reusable', 'vase']); // 'box' is free
+	const PREMIUM_SYSTEMS = new Set(SYSTEMS.filter((s) => s.id !== 'box').map((s) => s.id));
 	const PREMIUM_MOULD_TYPES = new Set(['four_part', 'six_part']);
 	const PREMIUM_RESOLUTIONS = new Set(['fine', 'custom']);
 	const PREMIUM_REFINEMENTS = new Set(['cad_exact']);
 
-	function lockedCard(id) { return subChecked && !isPremium && PREMIUM_CARDS.has(id); }
+	function lockedCard(id) { return subChecked && !isPremium && PREMIUM_SYSTEMS.has(id); }
 	function lockedType(v) { return subChecked && !isPremium && PREMIUM_MOULD_TYPES.has(v); }
 	function lockedRes(v) { return subChecked && !isPremium && PREMIUM_RESOLUTIONS.has(v); }
 	function lockedRefine(v) { return subChecked && !isPremium && PREMIUM_REFINEMENTS.has(v); }
 
-	// ---- params (names MUST match backend MouldParams serde) ----------------
+	// ---- params (existing names MUST match backend MouldParams serde) -------
 	let params = $state({
+		mould_system: 'box',
+		splits: [],
+
 		mould_type: 'two_part',
 		mould_style: 'block',
 		radial_orientation: 'auto',
@@ -122,17 +214,75 @@
 		draft_angle_deg: 1.0,
 		undercut_relief: true,
 
-		// conformal clamshell parting flange (only used when mould_style === 'conformal')
-		flange_thickness_mm: 6,
+		// mating flange along every split (all split systems)
+		flange_thickness_mm: 5,
 		flange_reach_mm: 10,
 
-		// silicone mould box (only used when mould_style === 'silicone_box')
+		// silicone jacket / tray
 		silicone_gap_mm: 12,
 		box_wall_mm: 3,
 		master_seat: true,
 		master_clearance_mm: 0.3,
 		base_flange_mm: 8,
 		silicone_type: 'box',
+		base_style: 'rect',
+		base_bolts: true,
+		bolt_diameter_mm: 3.4,
+		master_seal: true,
+		base_key_count: 4,
+		base_key_diameter_mm: 6,
+
+		// master prep
+		foundation_mm: 0,
+		air_trap_detect: true,
+		air_trap_pillars: false,
+		pillar_diameter_mm: 3,
+
+		// pour system (jacket, direct funnel, skin)
+		pour_diameter_mm: 14,
+		pour_top_diameter_mm: 24,
+		riser_count: 2,
+		riser_diameter_mm: 4,
+
+		// split keys + clamps (non-block systems)
+		split_key_count: 4,
+		clamp_holes: true,
+		clamp_hole_diameter_mm: 3.4,
+
+		// inner cavity
+		core_mode: 'auto',
+		cast_wall_mm: 3,
+		core_draft_deg: 1.5,
+
+		// slip casting
+		plaster_thickness_mm: 25,
+		slip_spare_diameter_mm: 30,
+		slip_spare_height_mm: 25,
+		top_trim_mm: 0,
+
+		// direct print
+		direct_clearance_mm: 0.3,
+		direct_wall_mm: 3,
+
+		// skin
+		skin_thickness_mm: 3,
+
+		// fixture
+		fixture_depth_pct: 40,
+		fixture_margin_mm: 8,
+		fixture_base_mm: 4,
+		fixture_clearance_mm: 0.4,
+
+		// protective shell
+		shell_clearance_mm: 1.5,
+		shell_wall_mm: 3,
+
+		// branding + mesh
+		brand_text: '',
+		brand_mode: 'engrave',
+		brand_size_mm: 6,
+		brand_volume_label: false,
+		mesh_repair: true,
 
 		resolution: 'standard',
 		voxel_size_mm: 0.5,
@@ -174,10 +324,6 @@
 			{ v: 'axis', l: 'Axis pulls' },
 			{ v: 'diagonal', l: '45° pulls' }
 		],
-		mould_style: [
-			{ v: 'block', l: 'Block' },
-			{ v: 'silicone_box', l: 'Silicone' }
-		],
 		parting_axis: [
 			{ v: 'x', l: 'X' },
 			{ v: 'y', l: 'Y' },
@@ -217,6 +363,19 @@
 			{ v: 4, l: '4' },
 			{ v: 6, l: '6' }
 		],
+		base_style: [
+			{ v: 'rect', l: 'Rectangular' },
+			{ v: 'contour', l: 'Follows outline' }
+		],
+		core_mode: [
+			{ v: 'auto', l: 'Auto' },
+			{ v: 'plug', l: 'Plug a bore' },
+			{ v: 'hollow', l: 'Hollow vessel' }
+		],
+		brand_mode: [
+			{ v: 'engrave', l: 'Engraved' },
+			{ v: 'raise', l: 'Raised' }
+		],
 		resolution: [
 			{ v: 'draft', l: 'Draft · 0.8' },
 			{ v: 'standard', l: 'Standard · 0.5' },
@@ -230,57 +389,61 @@
 	};
 
 	// ---- derived ------------------------------------------------------------
+	let sys = $derived(params.mould_system);
+	let fam = $derived(FAMILY[params.mould_system] || 'block');
+	let sysInfo = $derived(SYSTEM_BY_ID[params.mould_system] || SYSTEMS[0]);
+	let isBlock = $derived(fam === 'block');
 	let isTwoPart = $derived(params.mould_type === 'two_part');
 	let isFourPart = $derived(params.mould_type === 'four_part');
 	let isSixPart = $derived(params.mould_type === 'six_part');
-	let isRadial = $derived(isFourPart || isSixPart);
+	let isRadial = $derived(isBlock && (isFourPart || isSixPart));
 	let isOnePart = $derived(params.mould_type === 'one_part');
-	let isConformal = $derived(false); // Conformal style retired — Block + Silicone only
-	let isSilicone = $derived(params.mould_style === 'silicone_box' && !isRadial);
-	let showPartingSurface = $derived(isTwoPart && !isSilicone);
-	let showFlange = $derived(false);
-	let mouldTypeOptions = $derived(
-		params.mould_style === 'silicone_box'
-			? [ { v: 'two_part', l: 'Split (2-part)' }, { v: 'one_part', l: 'Tray (1-part)' } ]
-			: seg.mould_type
+	let splitCapable = $derived(!isBlock && fam !== 'fixture');
+	let hasSplits = $derived(splitCapable && params.splits.length > 0);
+	let coreHollow = $derived(
+		params.mould_system === 'core' &&
+			(params.core_mode === 'hollow' || (params.core_mode === 'auto' && previewStats?.core_mode === 'hollow'))
 	);
+	let hasPour = $derived(
+		fam === 'skin' || fam === 'direct_funnel' || (fam === 'silicone' && params.mould_system !== 'slip' && !coreHollow)
+	);
+	let hasBase = $derived(fam === 'silicone' || fam === 'tray');
+	let pourFromTop = $derived(fam === 'silicone' || fam === 'tray' || fam === 'skin');
+	let showPartingSurface = $derived(isBlock && isTwoPart);
 	let showOffset = $derived(params.parting_mode === 'offset');
+	let serverReady = $derived(SERVER_SYSTEMS.has(params.mould_system));
 
-	// --- Card-style mould-type picker
-	const MOULD_CARDS = [
-		{ id: 'box', title: 'Two-part box', tags: ['Candles', 'Soap', 'Wax'], style: 'block', stype: 'box', mtype: 'two_part',
-		  hint: 'A solid rigid block split into two halves. Cast plaster, wax or soap directly into it — no silicone needed.',
-		  svg: '<rect x="4" y="7" width="9" height="20" rx="1.5"/><rect x="19" y="7" width="9" height="20" rx="1.5"/>' },
-		{ id: 'adaptive', title: 'Adaptive silicone', tags: ['Figures', 'Resin', 'Detail'], style: 'silicone_box', stype: 'box', mtype: 'two_part',
-		  hint: 'A rigid two-part jacket that follows the part. Pour silicone into the gap, cure, open it and peel off a reusable silicone negative — then cast resin/plaster in that.',
-		  svg: '<path d="M16 5 C9 5 6 10 6 16 C6 23 10 27 16 27" fill="none" stroke-width="2.4"/><path d="M16 5 C23 5 26 10 26 16 C26 23 22 27 16 27" fill="none" stroke-width="2.4"/>' },
-		{ id: 'reusable', title: 'Reusable silicone', tags: ['Reliefs', 'Coins', 'Soap'], style: 'silicone_box', stype: 'box', mtype: 'one_part',
-		  hint: 'A one-part open tray the master nests into. Pour silicone over the top, cure, then flex the reusable mould off — ideal for coins, tiles and flat reliefs.',
-		  svg: '<path d="M5 12 h22 v11 a2 2 0 0 1 -2 2 h-18 a2 2 0 0 1 -2 -2 z" fill="none" stroke-width="2.2"/><ellipse cx="16" cy="12" rx="11" ry="3"/>' },
-		{ id: 'vase', title: 'Vase & planter', tags: ['Planters', 'Pots', 'Rings'], style: 'silicone_box', stype: 'core', mtype: 'two_part',
-		  hint: 'For hollow / tubular parts. A two-part jacket PLUS an inner core (with a pull-wheel) that plugs the bore, so silicone forms the inside wall instead of filling it solid.',
-		  svg: '<path d="M8 8 v14 a8 8 0 0 0 16 0 v-14" fill="none" stroke-width="2.2"/><ellipse cx="16" cy="8" rx="8" ry="2.6"/><circle cx="16" cy="15" r="4.5" fill="none" stroke-width="2"/>' }
-	];
-	function selectMouldCard(c) {
-		if (lockedCard(c.id)) { goUpgrade(); return; }
-		params.mould_style = c.style;
-		params.silicone_type = c.stype;
-		params.mould_type = c.mtype;
+	function selectSystem(s) {
+		if (lockedCard(s.id)) { goUpgrade(); return; }
+		if (params.mould_system === s.id) return;
+		params.mould_system = s.id;
+		params.splits = s.splits.map((r) => ({ ...r }));
+		// backend-compat fields for the systems the current server knows
+		if (s.id === 'box') { params.mould_style = 'block'; if (!['two_part', 'four_part', 'six_part', 'one_part'].includes(params.mould_type)) params.mould_type = 'two_part'; }
+		else if (s.id === 'adaptive') { params.mould_style = 'silicone_box'; params.silicone_type = 'box'; params.mould_type = 'two_part'; }
+		else if (s.id === 'tray') { params.mould_style = 'silicone_box'; params.silicone_type = 'box'; params.mould_type = 'one_part'; }
+		else if (s.id === 'core') { params.mould_style = 'silicone_box'; params.silicone_type = 'core'; params.mould_type = 'two_part'; }
+		else { params.mould_style = s.id; params.mould_type = s.splits.length ? 'two_part' : 'one_part'; }
+		if (s.id === 'core') params.core_mode = 'auto';
+		params.base_style = s.id === 'tray' ? 'contour' : 'rect';
+		if (s.id === 'slip' && params.top_trim_mm < 0) params.top_trim_mm = 0;
 	}
+
+	// ---- split plane editor ---------------------------------------------------
+	function addSplit() {
+		if (params.splits.length >= 3) return;
+		const used = new Set(params.splits.map((r) => r.axis));
+		const axis = ['x', 'y', 'z'].find((a) => !used.has(a)) || 'x';
+		params.splits = [...params.splits, { axis, offset_mm: 0, angle_deg: 0 }];
+	}
+	function removeSplit(i) {
+		params.splits = params.splits.filter((_, k) => k !== i);
+	}
+
 	// gated setters for the premium segmented controls
 	function setMouldType(v) { if (lockedType(v)) { goUpgrade(); return; } params.mould_type = v; }
 	function setResolution(v) { if (lockedRes(v)) { goUpgrade(); return; } params.resolution = v; }
 	function setRefinement(v) { if (lockedRefine(v)) { goUpgrade(); return; } params.surface_refinement = v; }
-
-	let activeCard = $derived(
-		params.mould_style === 'silicone_box'
-			? params.silicone_type === 'core'
-				? 'vase'
-				: params.mould_type === 'one_part'
-					? 'reusable'
-					: 'adaptive'
-			: (params.mould_type === 'two_part' ? 'box' : 'block-adv')
-	);
 
 	let showCustomVoxel = $derived(params.resolution === 'custom');
 	let showSprue = $derived(params.gate_type !== 'none' && !isOnePart);
@@ -289,51 +452,56 @@
 	let showRunner = $derived(params.gate_type === 'side' && isTwoPart);
 	let showValves = $derived(params.valve_type !== 'none' && !isOnePart);
 	let effectiveVoxel = $derived(
-		params.resolution === 'draft'
-			? 0.8
-			: params.resolution === 'standard'
-				? 0.5
-				: params.resolution === 'fine'
-					? 0.3
-					: Number(params.voxel_size_mm) || 0.5
+		params.resolution === 'draft' ? 0.8
+		: params.resolution === 'standard' ? 0.5
+		: params.resolution === 'fine' ? 0.3
+		: Number(params.voxel_size_mm) || 0.5
 	);
 	let canSubmit = $derived(!!file && phase !== 'uploading');
 
 	// ---- tabs ---------------------------------------------------------------
 	const TABS = [
 		{ id: 'model', label: 'Model' },
-		{ id: 'mould', label: 'Mould' },
-		{ id: 'box', label: 'Box' },
+		{ id: 'mould', label: 'System' },
+		{ id: 'shell', label: 'Shell' },
 		{ id: 'cavity', label: 'Cavity' },
 		{ id: 'feed', label: 'Feed' },
+		{ id: 'pour', label: 'Pour' },
 		{ id: 'vents', label: 'Vents' },
 		{ id: 'keys', label: 'Keys' },
+		{ id: 'master', label: 'Master' },
+		{ id: 'extras', label: 'Extras' },
 		{ id: 'quality', label: 'Quality' }
 	];
+	let shellTabLabel = $derived(
+		fam === 'silicone' ? 'Jacket'
+		: fam === 'tray' ? 'Tray'
+		: fam === 'fixture' ? 'Fixture'
+		: fam === 'shell' ? 'Case'
+		: 'Shell'
+	);
 	let tab = $state('model');
 	let visibleTabs = $derived(
 		TABS.filter((t) => {
-			if (t.id === 'box') return isSilicone;
-			if (isSilicone) {
-				if (t.id === 'cavity' || t.id === 'feed' || t.id === 'vents') return false;
-				if (t.id === 'keys') return isTwoPart;
-				return true;
+			switch (t.id) {
+				case 'model': case 'mould': case 'extras': case 'quality': return true;
+				case 'shell': return !isBlock;
+				case 'cavity': return isBlock;
+				case 'feed': case 'vents': return isBlock && !isOnePart;
+				case 'pour': return hasPour;
+				case 'keys': return isBlock ? !isOnePart : hasSplits;
+				case 'master': return !isBlock && fam !== 'fixture' && fam !== 'shell';
+				default: return true;
 			}
-			if ((t.id === 'feed' || t.id === 'vents' || t.id === 'keys') && isOnePart) return false;
-			return true;
-		})
+		}).map((t) => (t.id === 'shell' ? { ...t, label: shellTabLabel } : t))
 	);
-	$effect(() => {
-		if (params.mould_style === 'silicone_box' && (isFourPart || isSixPart)) {
-			params.mould_type = 'two_part';
-		}
-	});
 	$effect(() => {
 		if (!visibleTabs.some((t) => t.id === tab)) tab = 'mould';
 	});
 
+
 	// ---- request state ------------------------------------------------------
-	let phase = $state('idle'); // idle | uploading | done | error
+	let phase = $state('idle');
 	let errorMsg = $state('');
 	let report = $state(null);
 	let mouldToken = $state('');
@@ -342,16 +510,8 @@
 	let downloading = $state(false);
 	let elapsed = $state(0);
 	let elapsedTimer = null;
-
-	// tracks that a free account has generated once this session (UI hint only —
-	// the server is the source of truth for the daily quota).
 	let freeUsedToday = $state(false);
 
-	// ---- lifecycle: know who's signed in + whether they're Pro -------------
-	// initAuth() is awaited FIRST so an expired access token is refreshed before
-	// the plan check (this page's onMount runs before the layout's). The plan is
-	// re-checked when the tab regains focus, so paying in another tab and coming
-	// back unlocks Pro without a reload.
 	onMount(() => {
 		let alive = true;
 		(async () => {
@@ -418,6 +578,7 @@
 	function clearFile() {
 		setShared(null, null);
 		fileError = '';
+		previewStats = null;
 		resetResult();
 	}
 	function onPick(e) {
@@ -427,9 +588,7 @@
 	function onDrop(e) {
 		e.preventDefault();
 		dragOver = false;
-		if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-			acceptFile(e.dataTransfer.files[0]);
-		}
+		if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) acceptFile(e.dataTransfer.files[0]);
 	}
 	function onVoxelBlur() {
 		let v = Number(params.voxel_size_mm);
@@ -440,18 +599,20 @@
 	// Mirrors the backend MouldParams::clamp() so the UI never shows a value the
 	// server would silently rewrite.
 	function clampParams(p) {
-		const c = { ...p };
+		const c = JSON.parse(JSON.stringify(p));
 		const n = (v, def) => {
 			const x = Number(v);
 			return isFinite(x) ? x : def;
 		};
 		const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+		const bool = (v) => !!v;
 
+		if (!FAMILY[c.mould_system]) c.mould_system = 'box';
 		if (!['auto', 'axis', 'diagonal'].includes(c.radial_orientation)) c.radial_orientation = 'auto';
 		c.parting_offset_mm = clamp(n(c.parting_offset_mm, 0), -500, 500);
 		c.wall_thickness_mm = clamp(n(c.wall_thickness_mm, 8), 3, 40);
 		c.cavity_clearance_mm = clamp(n(c.cavity_clearance_mm, 0.15), 0, 2);
-		c.flange_thickness_mm = clamp(n(c.flange_thickness_mm, 6), 2, 20);
+		c.flange_thickness_mm = clamp(n(c.flange_thickness_mm, 5), 2, 20);
 		c.flange_reach_mm = clamp(n(c.flange_reach_mm, 10), 3, 40);
 		c.shrinkage_percent = clamp(n(c.shrinkage_percent, 0), -5, 8);
 		c.draft_angle_deg = clamp(n(c.draft_angle_deg, 1), 0, 10);
@@ -474,28 +635,104 @@
 		if (!['standard', 'cad_exact'].includes(c.surface_refinement)) c.surface_refinement = 'standard';
 		if (!['flat', 'follow'].includes(c.parting_surface)) c.parting_surface = 'flat';
 		if (c.mould_type !== 'two_part' && c.parting_surface === 'follow') c.parting_surface = 'flat';
-		if (c.mould_style === 'conformal' && c.parting_surface === 'follow') c.parting_surface = 'flat';
+
+		// silicone jacket / tray / base
 		c.silicone_gap_mm = clamp(n(c.silicone_gap_mm, 12), 3, 50);
 		c.box_wall_mm = clamp(n(c.box_wall_mm, 3), 1.5, 12);
-		c.master_seat = !!c.master_seat;
+		c.master_seat = bool(c.master_seat);
 		c.master_clearance_mm = clamp(n(c.master_clearance_mm, 0.3), 0, 2);
 		c.base_flange_mm = clamp(n(c.base_flange_mm, 8), 0, 30);
+		c.base_style = c.base_style === 'contour' ? 'contour' : 'rect';
+		c.base_bolts = bool(c.base_bolts);
+		c.bolt_diameter_mm = clamp(n(c.bolt_diameter_mm, 3.4), 2, 8);
+		c.master_seal = bool(c.master_seal);
+		c.base_key_count = clamp(Math.round(n(c.base_key_count, 4)), 0, 8);
+		c.base_key_diameter_mm = clamp(n(c.base_key_diameter_mm, 6), 2, 16);
 		if (c.silicone_type !== 'core') c.silicone_type = 'box';
-		if (c.mould_style === 'silicone_box') {
-			if (c.mould_type !== 'two_part' && c.mould_type !== 'one_part') c.mould_type = 'two_part';
+
+		// master prep
+		c.foundation_mm = clamp(n(c.foundation_mm, 0), 0, 20);
+		c.air_trap_detect = bool(c.air_trap_detect);
+		c.air_trap_pillars = bool(c.air_trap_pillars) && c.air_trap_detect;
+		c.pillar_diameter_mm = clamp(n(c.pillar_diameter_mm, 3), 1.5, 8);
+
+		// pour
+		c.pour_diameter_mm = clamp(n(c.pour_diameter_mm, 14), 4, 40);
+		c.pour_top_diameter_mm = clamp(n(c.pour_top_diameter_mm, 24), c.pour_diameter_mm, 70);
+		c.riser_count = clamp(Math.round(n(c.riser_count, 2)), 0, 6);
+		c.riser_diameter_mm = clamp(n(c.riser_diameter_mm, 4), 1.5, 12);
+
+		// split keys / clamps
+		c.split_key_count = clamp(Math.round(n(c.split_key_count, 4)), 0, 8);
+		c.clamp_holes = bool(c.clamp_holes);
+		c.clamp_hole_diameter_mm = clamp(n(c.clamp_hole_diameter_mm, 3.4), 2, 8);
+		if (!['dome', 'cone', 'none'].includes(c.key_shape)) c.key_shape = 'dome';
+
+		// splits
+		c.splits = (Array.isArray(c.splits) ? c.splits : []).slice(0, 3).map((r) => ({
+			axis: ['x', 'y', 'z'].includes(r.axis) ? r.axis : 'x',
+			offset_mm: clamp(n(r.offset_mm, 0), -500, 500),
+			angle_deg: clamp(n(r.angle_deg, 0), -89, 89)
+		}));
+		if (c.mould_system === 'fixture' || c.mould_system === 'box') c.splits = [];
+
+		// inner cavity / slip
+		if (!['auto', 'plug', 'hollow'].includes(c.core_mode)) c.core_mode = 'auto';
+		c.cast_wall_mm = clamp(n(c.cast_wall_mm, 3), 1, 20);
+		c.core_draft_deg = clamp(n(c.core_draft_deg, 1.5), 0, 10);
+		c.plaster_thickness_mm = clamp(n(c.plaster_thickness_mm, 25), 10, 60);
+		c.slip_spare_diameter_mm = clamp(n(c.slip_spare_diameter_mm, 30), 0, 120);
+		c.slip_spare_height_mm = clamp(n(c.slip_spare_height_mm, 25), 0, 80);
+		c.top_trim_mm = clamp(n(c.top_trim_mm, 0), 0, 200);
+
+		// direct / skin / fixture / shell
+		c.direct_clearance_mm = clamp(n(c.direct_clearance_mm, 0.3), 0, 2);
+		c.direct_wall_mm = clamp(n(c.direct_wall_mm, 3), 1.5, 15);
+		c.skin_thickness_mm = clamp(n(c.skin_thickness_mm, 3), 0.8, 15);
+		c.fixture_depth_pct = clamp(n(c.fixture_depth_pct, 40), 10, 90);
+		c.fixture_margin_mm = clamp(n(c.fixture_margin_mm, 8), 3, 40);
+		c.fixture_base_mm = clamp(n(c.fixture_base_mm, 4), 2, 30);
+		c.fixture_clearance_mm = clamp(n(c.fixture_clearance_mm, 0.4), 0, 3);
+		c.shell_clearance_mm = clamp(n(c.shell_clearance_mm, 1.5), 0.2, 10);
+		c.shell_wall_mm = clamp(n(c.shell_wall_mm, 3), 1.2, 12);
+
+		// branding
+		c.brand_text = String(c.brand_text || '').slice(0, 40);
+		c.brand_mode = c.brand_mode === 'raise' ? 'raise' : 'engrave';
+		c.brand_size_mm = clamp(n(c.brand_size_mm, 6), 3, 30);
+		c.brand_volume_label = bool(c.brand_volume_label);
+		c.mesh_repair = bool(c.mesh_repair);
+
+		// backend-compat mirror of the first split
+		if (c.splits.length) {
+			c.parting_axis = c.splits[0].axis;
+			c.parting_mode = c.splits[0].offset_mm ? 'offset' : 'center';
+			c.parting_offset_mm = c.splits[0].offset_mm;
+		}
+		if (c.mould_system === 'box') {
+			c.mould_style = 'block';
+		} else if (c.mould_system === 'adaptive' || c.mould_system === 'core') {
+			c.mould_style = 'silicone_box';
+			c.silicone_type = c.mould_system === 'core' ? 'core' : 'box';
+			c.mould_type = 'two_part';
+			c.parting_surface = 'flat';
+		} else if (c.mould_system === 'tray') {
+			c.mould_style = 'silicone_box';
+			c.silicone_type = 'box';
+			c.mould_type = 'one_part';
+			c.parting_surface = 'flat';
+		} else {
+			c.mould_style = c.mould_system;
+			c.mould_type = c.splits.length ? 'two_part' : 'one_part';
 			c.parting_surface = 'flat';
 		}
-		if (c.mould_style === 'conformal') c.mould_style = 'block';
 		return c;
 	}
 
 	// ---- submit -------------------------------------------------------------
-	// `retried` is true only for the automatic second attempt made after a 402
-	// turned out to be a stale plan (the account is actually Pro).
 	async function generate(retried = false) {
 		if (!canSubmit) return;
 
-		// LOGIN REQUIRED — refreshes an expired access token if possible.
 		const token = await getValidAccessToken();
 		if (!token) {
 			showUpgrade = false;
@@ -525,8 +762,6 @@
 			fd.append('params', JSON.stringify(clean));
 			fd.append('file', file, file.name);
 
-			// NOTE: do not set Content-Type — the browser adds the multipart
-			// boundary. authFetch only attaches the Authorization header.
 			const res = await authFetch(`${API}/calc/mould/v2/generate?source=mould_studio`, {
 				method: 'POST',
 				body: fd
@@ -541,9 +776,7 @@
 				/* plain-text error body */
 			}
 
-			// ---- access-control responses ----
 			if (res.status === 401) {
-				// authFetch already tried a token refresh — the session is gone.
 				loggedIn = false;
 				errorMsg = 'Your session has expired — please sign in again.';
 				phase = 'error';
@@ -551,8 +784,6 @@
 				return;
 			}
 			if (res.status === 402) {
-				// The server just re-checked the plan (and reconciles captured
-				// payments). Refresh our view; if we are actually Pro now, retry.
 				await checkSubscription(true);
 				if (isPremium && !retried) {
 					retryAsPro = true;
@@ -567,7 +798,6 @@
 				return;
 			}
 			if (res.status === 429) {
-				// DAILY_LIMIT_REACHED
 				await checkSubscription(true);
 				if (isPremium && !retried) {
 					retryAsPro = true;
@@ -583,8 +813,9 @@
 
 			const okStatus = body && (body.status === 'ok' || body.status === 'success');
 			if (!res.ok || !body || !okStatus) {
-				const msg =
-					(body && (body.message || body.error)) || rawText || `Generation failed (HTTP ${res.status}).`;
+				let msg = (body && (body.message || body.error)) || rawText || `Generation failed (HTTP ${res.status}).`;
+				if (!serverReady && (res.status === 400 || res.status === 422))
+					msg += ` — the “${sysInfo.title}” system needs the updated generator backend; the preview above is exact to your settings.`;
 				throw new Error(msg);
 			}
 
@@ -592,8 +823,6 @@
 			mouldToken = body.token || '';
 			downloadUrl = body.download_url || '';
 			phase = 'done';
-
-			// Free accounts just spent today's mould — reflect that in the UI hint.
 			if (!isPremium) freeUsedToday = true;
 		} catch (err) {
 			errorMsg = err && err.message ? err.message : 'The mould could not be generated. Try again.';
@@ -604,8 +833,6 @@
 				elapsedTimer = null;
 			}
 			if (retryAsPro) {
-				// Scheduled after this call has fully unwound so the retry gets
-				// its own timer and state.
 				phase = 'idle';
 				setTimeout(() => generate(true), 0);
 			}
@@ -653,7 +880,7 @@
 			a.rel = 'noopener';
 			const raw = file && file.name ? file.name.replace(/\.[^.]+$/, '') : 'model';
 			const base = (raw || 'model').replace(/[^\w.-]+/g, '_');
-			a.download = `${base}_mould.zip`;
+			a.download = `${base}_${params.mould_system}_mould.zip`;
 			document.body.appendChild(a);
 			a.click();
 			a.remove();
@@ -670,19 +897,31 @@
 	}
 
 	let typeLabel = $derived(
-		params.mould_type === 'two_part'
-			? 'Two-part'
-			: params.mould_type === 'four_part'
-				? 'Four-part radial'
-				: params.mould_type === 'six_part'
-					? 'Six-part radial'
-					: 'Open pour'
+		!isBlock
+			? sysInfo.title
+			: params.mould_type === 'two_part' ? 'Two-part box'
+			: params.mould_type === 'four_part' ? 'Four-part radial'
+			: params.mould_type === 'six_part' ? 'Six-part radial'
+			: 'Open pour block'
+	);
+	let splitLabel = $derived(
+		params.splits.length
+			? params.splits.map((r) => `${r.axis.toUpperCase()}${r.offset_mm ? (r.offset_mm > 0 ? '+' : '') + r.offset_mm : ''}${r.angle_deg ? ' ∠' + r.angle_deg + '°' : ''}`).join(' · ')
+			: 'none (one piece)'
+	);
+	let fillName = $derived(
+		sys === 'slip' ? 'Plaster needed' : fam === 'direct_open' || fam === 'direct_funnel' ? 'Casting volume' : fam === 'skin' ? 'Skin material' : 'Silicone needed'
+	);
+	let piecesText = $derived(
+		previewStats
+			? `${previewStats.pieces} ${fam === 'silicone' ? 'jacket' : 'mould'} piece${previewStats.pieces === 1 ? '' : 's'}${previewStats.has_core ? ' + core' : ''}`
+			: '—'
 	);
 </script>
 
 <svelte:head>
 	<title>Mould Studio — design a print-ready mould</title>
-	<meta name="description" content="Interactive studio for turning a 3D model into a print-ready casting mould, with a live 3D preview of the cavity, parting, sprue, vents and keys." />
+	<meta name="description" content="Interactive studio for turning a 3D model into a print-ready mould system — silicone jackets, trays, cores, slip-casting cases, direct-print moulds, skins, fixtures and protective shells — with a live 3D preview." />
 	<meta name="robots" content="noindex" />
 </svelte:head>
 
@@ -699,7 +938,7 @@
 			<path d="M7.8 18.5A6.5 7.5 0 0 1 7.8 5.5" />
 			<path d="M16.2 5.5A6.5 7.5 0 0 1 16.2 18.5" />
 		</svg>
-	{:else if id === 'box'}
+	{:else if id === 'shell'}
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<path d="M4 6v13a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V6" />
 			<path d="M2.5 6h19" />
@@ -710,7 +949,7 @@
 			<rect x="3" y="3" width="18" height="18" rx="4" />
 			<rect x="7.5" y="7.5" width="9" height="9" rx="2.5" />
 		</svg>
-	{:else if id === 'feed'}
+	{:else if id === 'feed' || id === 'pour'}
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<path d="M3 5h18l-7 8v6l-4-2.2V13z" />
 		</svg>
@@ -726,6 +965,17 @@
 			<circle cx="17" cy="12" r="3.4" />
 			<line x1="10.4" y1="12" x2="13.6" y2="12" stroke-dasharray="1.5 1.8" />
 		</svg>
+	{:else if id === 'master'}
+		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+			<circle cx="12" cy="7" r="3.5" />
+			<path d="M7 20c0-4 2.2-7 5-7s5 3 5 7" />
+			<path d="M4 20.5h16" />
+		</svg>
+	{:else if id === 'extras'}
+		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+			<path d="M3 12V4h8l10 10-8 8z" />
+			<circle cx="7.5" cy="8.5" r="1.4" />
+		</svg>
 	{:else if id === 'quality'}
 		<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 			<circle cx="12" cy="12" r="8" />
@@ -736,6 +986,13 @@
 {/snippet}
 
 {#snippet proTag()}<span class="pro-tag">PRO</span>{/snippet}
+
+{#snippet numField(id, label, key, step, min, max, unit)}
+	<div class="field">
+		<label class="lbl" for={id}>{label}</label>
+		<div class="num"><input {id} type="number" {step} {min} {max} bind:value={params[key]} />{#if unit}<span class="u">{unit}</span>{/if}</div>
+	</div>
+{/snippet}
 
 <div class="studio">
 	<!-- ===================== HEADER ===================== -->
@@ -760,10 +1017,9 @@
 			{/if}
 		</div>
 
-		<!-- account / plan -->
 		<div class="bar-account">
 			{#if !subChecked}
-				<!-- status loading: render nothing to avoid a flash -->
+				<!-- status loading -->
 			{:else if !loggedIn}
 				<a class="mini" href={LOGIN_PATH}>Sign in</a>
 			{:else if isPremium}
@@ -783,7 +1039,7 @@
 
 	<!-- ===================== SECOND NAVBAR: SECTION TABS ===================== -->
 	<nav class="tabs">
-		{#each visibleTabs as t}
+		{#each visibleTabs as t (t.id)}
 			<button type="button" class="tab {tab === t.id ? 'on' : ''}" onclick={() => (tab = t.id)}>
 				<span class="tab-ico">{@render tabIcon(t.id)}</span>
 				<span class="tab-lbl">{t.label}</span>
@@ -805,10 +1061,7 @@
 							tabindex="0"
 							onclick={() => fileInputEl.click()}
 							onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), fileInputEl.click())}
-							ondragover={(e) => {
-								e.preventDefault();
-								dragOver = true;
-							}}
+							ondragover={(e) => { e.preventDefault(); dragOver = true; }}
 							ondragleave={() => (dragOver = false)}
 							ondrop={onDrop}>
 							<p class="drop-t">Drop model or click</p>
@@ -824,34 +1077,41 @@
 						</div>
 					{/if}
 					{#if fileError}<p class="err">{fileError}</p>{/if}
-					<p class="hint">The mesh should be watertight so the tool can define an inside to hollow out.</p>
+					<p class="hint">The mesh should be watertight so the tool can define an inside. Orient the model the way it should stand in the mould — the preview uses +Z as up.</p>
+					<label class="check" style="margin-top:14px;">
+						<input type="checkbox" bind:checked={params.mesh_repair} />
+						<span><strong>Repair mesh</strong> — close small holes, fix flipped faces and simplify dense meshes before building the mould.</span>
+					</label>
 					{#if subChecked && !loggedIn}
 						<p class="hint" style="margin-top:12px;">You'll need to <a href={LOGIN_PATH} style="color:#2563eb;font-weight:600;">sign in</a> to generate — it's free, one mould per day.</p>
 					{/if}
 				</section>
 			{/if}
 
-			<!-- MOULD -->
+			<!-- SYSTEM -->
 			{#if tab === 'mould'}
 				<section class="grp">
-					<h3>Mould setup</h3>
-
+					<h3>Mould system</h3>
 					<div class="field">
-						<span class="lbl">Mould type</span>
 						<div class="mcards">
-							{#each MOULD_CARDS as c}
-								<button type="button" class="mcard {activeCard === c.id ? 'on' : ''} {lockedCard(c.id) ? 'locked' : ''}" onclick={() => selectMouldCard(c)}>
+							{#each SYSTEMS as c (c.id)}
+								<button type="button" class="mcard {sys === c.id ? 'on' : ''} {lockedCard(c.id) ? 'locked' : ''}" onclick={() => selectSystem(c)}>
 									{#if lockedCard(c.id)}{@render proTag()}{/if}
+									<span class="mcard-grp">{c.group}</span>
 									<svg class="mcard-ic" viewBox="0 0 32 32" aria-hidden="true">{@html c.svg}</svg>
 									<span class="mcard-ti">{c.title}</span>
 									<span class="mcard-tags">{#each c.tags as t}<em>{t}</em>{/each}</span>
 								</button>
 							{/each}
 						</div>
-						<p class="hint">{MOULD_CARDS.find((c) => c.id === activeCard)?.hint || 'A solid block mould split into multiple pieces for parts with side undercuts.'}</p>
+						<p class="hint">{sysInfo.hint}</p>
+						{#if !serverReady}
+							<p class="hint soon">Preview is exact to your settings. Server generation for this system rolls out with the next backend update.</p>
+						{/if}
 					</div>
 
-					{#if !isSilicone}
+					<!-- block-only controls -->
+					{#if isBlock}
 						<div class="field">
 							<span class="lbl">Block pieces</span>
 							<div class="segs">
@@ -863,136 +1123,209 @@
 							</div>
 							<p class="hint">Two-part splits on a plane. Four-part adds sideways wedges for side undercuts; six-part adds top and bottom caps. Open pour is a single open-top block.</p>
 						</div>
-					{/if}
 
-					{#if isRadial}
-						<div class="field">
-							<span class="lbl">Pull orientation</span>
-							<div class="segs">
-								{#each seg.radial_orientation as o}
-									<button type="button" class="seg {params.radial_orientation === o.v ? 'on' : ''}" onclick={() => (params.radial_orientation = o.v)}>{o.l}</button>
-								{/each}
-							</div>
-						</div>
-					{/if}
-
-					<div class="field">
-						<span class="lbl">{isSilicone ? 'Split axis' : 'Pull axis'}</span>
-						<div class="segs narrow">
-							{#each seg.parting_axis as o}
-								<button type="button" class="seg {params.parting_axis === o.v ? 'on' : ''}" onclick={() => (params.parting_axis = o.v)}>{o.l}</button>
-							{/each}
-						</div>
-						{#if isSilicone && isTwoPart}
-							<p class="hint">Which way the box splits. <strong>X or Y</strong> give a vertical clamshell — two halves that lift apart sideways, with the mating flange + keys down the edges (like the swan mould). <strong>Z</strong> gives a horizontal lid split. The base plate always stays at the bottom.</p>
-						{:else if isSilicone}
-							<p class="hint">A one-part tray doesn't split — the axis only sets orientation. The master nests in the base and you pour from the open top.</p>
-						{/if}
-					</div>
-
-					{#if isTwoPart}
-						<div class="field">
-							<span class="lbl">Parting plane</span>
-							<div class="segs">
-								{#each seg.parting_mode as o}
-									<button type="button" class="seg {params.parting_mode === o.v ? 'on' : ''}" onclick={() => (params.parting_mode = o.v)}>{o.l}</button>
-								{/each}
-							</div>
-							{#if showOffset}
-								<div class="inline">
-									<label for="poff">Offset</label>
-									<div class="num"><input id="poff" type="number" step="0.5" min="-500" max="500" bind:value={params.parting_offset_mm} /><span class="u">mm</span></div>
-								</div>
-							{/if}
-						</div>
-
-						{#if showPartingSurface}
+						{#if isRadial}
 							<div class="field">
-								<span class="lbl">Parting surface</span>
+								<span class="lbl">Pull orientation</span>
 								<div class="segs">
-									{#each seg.parting_surface as o}
-										<button type="button" class="seg {params.parting_surface === o.v ? 'on' : ''}" onclick={() => (params.parting_surface = o.v)}>{o.l}</button>
+									{#each seg.radial_orientation as o}
+										<button type="button" class="seg {params.radial_orientation === o.v ? 'on' : ''}" onclick={() => (params.radial_orientation = o.v)}>{o.l}</button>
 									{/each}
 								</div>
-								<p class="hint">{params.parting_surface === 'follow' ? 'Halves split on a curved surface tracing the widest silhouette; keys, vents and runner follow the curve.' : 'A flat plane at the parting height.'}</p>
+							</div>
+						{/if}
+
+						<div class="field">
+							<span class="lbl">Pull axis</span>
+							<div class="segs narrow">
+								{#each seg.parting_axis as o}
+									<button type="button" class="seg {params.parting_axis === o.v ? 'on' : ''}" onclick={() => (params.parting_axis = o.v)}>{o.l}</button>
+								{/each}
+							</div>
+						</div>
+
+						{#if isTwoPart}
+							<div class="field">
+								<span class="lbl">Parting plane</span>
+								<div class="segs">
+									{#each seg.parting_mode as o}
+										<button type="button" class="seg {params.parting_mode === o.v ? 'on' : ''}" onclick={() => (params.parting_mode = o.v)}>{o.l}</button>
+									{/each}
+								</div>
+								{#if showOffset}
+									<div class="inline">
+										<label for="poff">Offset</label>
+										<div class="num"><input id="poff" type="number" step="0.5" min="-500" max="500" bind:value={params.parting_offset_mm} /><span class="u">mm</span></div>
+									</div>
+								{/if}
+							</div>
+
+							{#if showPartingSurface}
+								<div class="field">
+									<span class="lbl">Parting surface</span>
+									<div class="segs">
+										{#each seg.parting_surface as o}
+											<button type="button" class="seg {params.parting_surface === o.v ? 'on' : ''}" onclick={() => (params.parting_surface = o.v)}>{o.l}</button>
+										{/each}
+									</div>
+									<p class="hint">{params.parting_surface === 'follow' ? 'Halves split on a curved surface tracing the widest silhouette; keys, vents and runner follow the curve.' : 'A flat plane at the parting height.'}</p>
+								</div>
+							{/if}
+						{/if}
+					{/if}
+
+					<!-- split plane editor (every split-capable system) -->
+					{#if splitCapable}
+						<div class="field">
+							<span class="lbl">Split planes</span>
+							{#if !params.splits.length}
+								<p class="hint" style="margin-top:0;">No splits — the {shellTabLabel.toLowerCase()} is one piece{fam === 'skin' ? ' that lifts straight off the core' : ''}.</p>
+							{/if}
+							{#each params.splits as r, i (i)}
+								<div class="split-row">
+									<div class="split-head">
+										<span class="split-n">Plane {i + 1}</span>
+										<div class="segs narrow">
+											{#each seg.parting_axis as o}
+												<button type="button" class="seg sm {r.axis === o.v ? 'on' : ''}" onclick={() => (r.axis = o.v)}>{o.l}</button>
+											{/each}
+										</div>
+										<button type="button" class="x-btn" onclick={() => removeSplit(i)} aria-label="Remove split plane {i + 1}">×</button>
+									</div>
+									<div class="g2 tight">
+										<div class="field">
+											<label class="lbl" for="soff{i}">Offset</label>
+											<div class="num"><input id="soff{i}" type="number" step="0.5" min="-500" max="500" bind:value={r.offset_mm} /><span class="u">mm</span></div>
+										</div>
+										<div class="field">
+											<label class="lbl" for="sang{i}">{r.axis === 'z' ? 'Tilt' : 'Rotate'}</label>
+											<div class="num"><input id="sang{i}" type="number" step="5" min="-89" max="89" bind:value={r.angle_deg} /><span class="u">°</span></div>
+										</div>
+									</div>
+								</div>
+							{/each}
+							{#if params.splits.length < 3}
+								<button type="button" class="add-btn" onclick={addSplit}>+ Add split plane</button>
+							{/if}
+							<p class="hint">
+								X / Y planes give vertical clamshells that pull apart sideways; Z gives a horizontal lid. Offset slides the plane from the part centre; rotate turns an X / Y plane around the vertical axis, tilt leans a Z plane. Each plane gets a mating flange{params.key_shape !== 'none' ? ' with keys' : ''}{params.clamp_holes ? ' and clamp holes' : ''}.
+							</p>
+						</div>
+					{/if}
+				</section>
+			{/if}
+
+			<!-- SHELL (per system) -->
+			{#if tab === 'shell' && !isBlock}
+				<section class="grp">
+					{#if fam === 'silicone'}
+						<h3>{sys === 'slip' ? 'Plaster case' : 'Silicone jacket'}</h3>
+						<div class="g2">
+							{#if sys === 'slip'}
+								{@render numField('plt', 'Plaster wall', 'plaster_thickness_mm', 1, 10, 60, 'mm')}
+							{:else}
+								{@render numField('sgap', 'Silicone gap', 'silicone_gap_mm', 1, 3, 50, 'mm')}
+							{/if}
+							{@render numField('bwall', 'Jacket wall', 'box_wall_mm', 0.5, 1.5, 12, 'mm')}
+						</div>
+						<p class="hint">{sys === 'slip' ? 'The printed case follows the master at this distance — fill it with plaster to make the slip-casting mould. 20–30 mm keeps the plaster absorbent and strong.' : 'The jacket follows the master at an even gap; silicone fills the gap. A bigger gap makes a thicker, stiffer silicone mould.'}</p>
+					{:else if fam === 'tray'}
+						<h3>Tray</h3>
+						<div class="g2">
+							{@render numField('sgap', 'Silicone gap', 'silicone_gap_mm', 1, 3, 50, 'mm')}
+							{@render numField('bwall', 'Tray wall', 'box_wall_mm', 0.5, 1.5, 12, 'mm')}
+						</div>
+						<p class="hint">Gap around and over the master — the silicone covers the top by the same amount.</p>
+					{:else if fam === 'direct_open' || fam === 'direct_funnel'}
+						<h3>Direct mould</h3>
+						<div class="g2">
+							{@render numField('dclr', 'Cavity clearance', 'direct_clearance_mm', 0.05, 0, 2, 'mm')}
+							{@render numField('dwall', 'Mould wall', 'direct_wall_mm', 0.5, 1.5, 15, 'mm')}
+							{@render numField('shr', 'Shrinkage', 'shrinkage_percent', 0.1, -5, 8, '%')}
+							{@render numField('draft', 'Draft angle', 'draft_angle_deg', 0.5, 0, 10, '°')}
+						</div>
+						<label class="check">
+							<input type="checkbox" bind:checked={params.undercut_relief} />
+							<span><strong>Clear extraction</strong> — remove undercuts along each piece's pull direction so it releases cleanly.</span>
+						</label>
+					{:else if fam === 'skin'}
+						<h3>Skin shell</h3>
+						<div class="g2">
+							{@render numField('skt', 'Skin thickness', 'skin_thickness_mm', 0.5, 0.8, 15, 'mm')}
+							{@render numField('bwall', 'Shell wall', 'box_wall_mm', 0.5, 1.5, 12, 'mm')}
+						</div>
+						<p class="hint">The printed core is your master on a base; the outer shell sits over it at the skin thickness. Pour latex or silicone through the funnel to form the skin.</p>
+					{:else if fam === 'fixture'}
+						<h3>Fixture</h3>
+						<div class="g2">
+							{@render numField('fdp', 'Pocket depth', 'fixture_depth_pct', 5, 10, 90, '%')}
+							{@render numField('fmg', 'Margin', 'fixture_margin_mm', 1, 3, 40, 'mm')}
+							{@render numField('fbs', 'Base under part', 'fixture_base_mm', 0.5, 2, 30, 'mm')}
+							{@render numField('fcl', 'Fit clearance', 'fixture_clearance_mm', 0.05, 0, 3, 'mm')}
+						</div>
+						<div class="field">
+							<span class="lbl">Outline</span>
+							<div class="segs">
+								{#each seg.base_style as o}
+									<button type="button" class="seg {params.base_style === o.v ? 'on' : ''}" onclick={() => (params.base_style = o.v)}>{o.l}</button>
+								{/each}
+							</div>
+						</div>
+						<p class="hint">Depth is how much of the part's height sits in the pocket. Finger notches are cut at both ends so the part lifts out.</p>
+					{:else if fam === 'shell'}
+						<h3>Protective case</h3>
+						<div class="g2">
+							{@render numField('scl', 'Clearance', 'shell_clearance_mm', 0.1, 0.2, 10, 'mm')}
+							{@render numField('swl', 'Case wall', 'shell_wall_mm', 0.5, 1.2, 12, 'mm')}
+						</div>
+						<p class="hint">Clearance is the gap around the model — add a little for foam or tissue lining.</p>
+					{/if}
+
+					{#if hasBase}
+						<div class="g2" style="margin-top:14px;">
+							{@render numField('bflange', 'Base flange', 'base_flange_mm', 1, 0, 30, 'mm')}
+							<div class="field">
+								<span class="lbl">Base plate</span>
+								<div class="segs">
+									{#each seg.base_style as o}
+										<button type="button" class="seg sm {params.base_style === o.v ? 'on' : ''}" onclick={() => (params.base_style = o.v)}>{o.l}</button>
+									{/each}
+								</div>
+							</div>
+						</div>
+						<label class="check">
+							<input type="checkbox" bind:checked={params.base_bolts} />
+							<span><strong>Base bolt holes</strong> — four holes through the base flange (needs ≥ 5 mm flange) to bolt the system to a board.</span>
+						</label>
+						{#if params.base_bolts}
+							<div class="inline">
+								<label for="bolt">Bolt hole Ø</label>
+								<div class="num"><input id="bolt" type="number" step="0.1" min="2" max="8" bind:value={params.bolt_diameter_mm} /><span class="u">mm</span></div>
 							</div>
 						{/if}
 					{/if}
-				</section>
-			{/if}
 
-			<!-- BOX (silicone mould box) -->
-			{#if tab === 'box' && isSilicone}
-				<section class="grp">
-					<h3>Silicone jacket</h3>
-					<div class="g2">
-						<div class="field">
-							<label class="lbl" for="sgap">Silicone gap</label>
-							<div class="num"><input id="sgap" type="number" step="1" min="3" max="50" bind:value={params.silicone_gap_mm} /><span class="u">mm</span></div>
+					{#if hasSplits || fam === 'direct_open' || fam === 'skin'}
+						<div class="g2" style="margin-top:14px;">
+							{@render numField('flt', fam === 'direct_open' ? 'Flange / wing thickness' : fam === 'skin' ? 'Skirt thickness' : 'Collar thickness', 'flange_thickness_mm', 0.5, 2, 20, 'mm')}
+							{@render numField('flr', fam === 'direct_open' ? 'Flange / wing reach' : fam === 'skin' ? 'Skirt reach' : 'Collar reach', 'flange_reach_mm', 1, 3, 40, 'mm')}
 						</div>
-						<div class="field">
-							<label class="lbl" for="bwall">Jacket wall</label>
-							<div class="num"><input id="bwall" type="number" step="0.5" min="1.5" max="12" bind:value={params.box_wall_mm} /><span class="u">mm</span></div>
-						</div>
-					</div>
-					<p class="hint">The jacket is a thin rigid shell that <em>follows your part</em>, offset outward by the silicone gap (the silicone fills that gap around the master). Bigger gap = thicker, stronger silicone mould. Jacket wall is the rigid printed shell thickness.</p>
-
-					<div class="field" style="margin-top:14px;">
-						<label class="lbl" for="bflange">Base flange</label>
-						<div class="num"><input id="bflange" type="number" step="1" min="0" max="30" bind:value={params.base_flange_mm} /><span class="u">mm</span></div>
-						<p class="hint">The flat base plate the jacket stands on, extending this far past the wall. ≥5&nbsp;mm adds clamp-bolt holes at the corners so the two halves bolt shut.</p>
-					</div>
-
-					<div class="g2" style="margin-top:14px;">
-						<div class="field">
-							<label class="lbl" for="mflt">Collar thickness</label>
-							<div class="num"><input id="mflt" type="number" step="0.5" min="3" max="20" bind:value={params.flange_thickness_mm} /><span class="u">mm</span></div>
-						</div>
-						<div class="field">
-							<label class="lbl" for="mflr">Collar reach</label>
-							<div class="num"><input id="mflr" type="number" step="1" min="4" max="30" bind:value={params.flange_reach_mm} /><span class="u">mm</span></div>
-						</div>
-					</div>
-					<p class="hint">The flat mating collar where the two halves meet, running down the split. Thickness is how deep the collar is across the seam (it carries the registration keys — thicker anchors bigger keys); reach is how far it sticks out past the part so you can clamp/bolt the seam.</p>
-
-					<label class="check">
-						<input type="checkbox" bind:checked={params.master_seat} />
-						<span><strong>Master locator socket</strong> — recess the part's footprint into the base plate so the master seats centred with even silicone all round.</span>
-					</label>
-
-					{#if params.master_seat}
-						<div class="field" style="margin-top:14px;">
-							<label class="lbl" for="mclr">Master fit clearance</label>
-							<div class="num"><input id="mclr" type="number" step="0.05" min="0" max="2" bind:value={params.master_clearance_mm} /><span class="u">mm</span></div>
-							<p class="hint">Gap around the master in its base socket so it seats without forcing. 0.2–0.4 mm for FDM prints.</p>
-						</div>
+						<p class="hint">
+							{#if fam === 'direct_open'}The flat wing around the open base lets the mould stand steady; the same collar runs down every split.{:else if fam === 'skin'}The shell's skirt rests on the core base and registers on pins.{:else}Each half gets a collar of this thickness along the split, sticking out by the reach — room for keys and clamp holes.{/if}
+						</p>
 					{/if}
-
-					<p class="hint">Workflow: print the two jacket halves, seat the master in the base, bolt/clip the halves shut, then pour liquid silicone through the open top to fill the gap. Once cured, open the jacket, peel the silicone off the master — you now have a reusable silicone negative. Pour plaster of Paris or resin into it (held in the jacket) to cast copies.</p>
 				</section>
 			{/if}
 
-			<!-- CAVITY -->
-			{#if tab === 'cavity'}
+			<!-- CAVITY (block) -->
+			{#if tab === 'cavity' && isBlock}
 				<section class="grp">
 					<h3>Cavity &amp; fit</h3>
 					<div class="g2">
-						<div class="field">
-							<label class="lbl" for="wall">Wall thickness</label>
-							<div class="num"><input id="wall" type="number" step="0.5" min="3" max="40" bind:value={params.wall_thickness_mm} /><span class="u">mm</span></div>
-						</div>
-						<div class="field">
-							<label class="lbl" for="clr">Cavity clearance</label>
-							<div class="num"><input id="clr" type="number" step="0.05" min="0" max="2" bind:value={params.cavity_clearance_mm} /><span class="u">mm</span></div>
-						</div>
-						<div class="field">
-							<label class="lbl" for="shr">Shrinkage</label>
-							<div class="num"><input id="shr" type="number" step="0.1" min="-5" max="8" bind:value={params.shrinkage_percent} /><span class="u">%</span></div>
-						</div>
-						<div class="field">
-							<label class="lbl" for="draft">Draft angle</label>
-							<div class="num"><input id="draft" type="number" step="0.5" min="0" max="10" bind:value={params.draft_angle_deg} /><span class="u">°</span></div>
-						</div>
+						{@render numField('wall', 'Wall thickness', 'wall_thickness_mm', 0.5, 3, 40, 'mm')}
+						{@render numField('clr', 'Cavity clearance', 'cavity_clearance_mm', 0.05, 0, 2, 'mm')}
+						{@render numField('shr', 'Shrinkage', 'shrinkage_percent', 0.1, -5, 8, '%')}
+						{@render numField('draft', 'Draft angle', 'draft_angle_deg', 0.5, 0, 10, '°')}
 					</div>
 					<label class="check">
 						<input type="checkbox" bind:checked={params.undercut_relief} />
@@ -1002,8 +1335,8 @@
 				</section>
 			{/if}
 
-			<!-- FEED -->
-			{#if tab === 'feed' && !isOnePart}
+			<!-- FEED (block) -->
+			{#if tab === 'feed' && isBlock && !isOnePart}
 				<section class="grp">
 					<h3>Feed system</h3>
 					<div class="field">
@@ -1026,44 +1359,34 @@
 							</div>
 						</div>
 						<div class="g2">
-							<div class="field">
-								<label class="lbl" for="spd">Sprue Ø</label>
-								<div class="num"><input id="spd" type="number" step="0.5" min="2" max="30" bind:value={params.sprue_diameter_mm} /><span class="u">mm</span></div>
-							</div>
-							{#if showTaper}
-								<div class="field">
-									<label class="lbl" for="spt">Taper</label>
-									<div class="num"><input id="spt" type="number" step="0.5" min="0" max="15" bind:value={params.sprue_taper_deg} /><span class="u">°</span></div>
-								</div>
-							{/if}
-							{#if showFunnel}
-								<div class="field">
-									<label class="lbl" for="fnl">Funnel top Ø</label>
-									<div class="num"><input id="fnl" type="number" step="1" min={params.sprue_diameter_mm} max="60" bind:value={params.funnel_top_diameter_mm} /><span class="u">mm</span></div>
-								</div>
-							{/if}
-							{#if showRunner}
-								<div class="field">
-									<label class="lbl" for="run">Runner Ø</label>
-									<div class="num"><input id="run" type="number" step="0.5" min="2" max="20" bind:value={params.runner_diameter_mm} /><span class="u">mm</span></div>
-								</div>
-							{/if}
-							<div class="field">
-								<label class="lbl" for="sox">Sprue offset X</label>
-								<div class="num"><input id="sox" type="number" step="0.5" bind:value={params.sprue_offset_x_mm} /><span class="u">mm</span></div>
-							</div>
-							<div class="field">
-								<label class="lbl" for="soy">Sprue offset Y</label>
-								<div class="num"><input id="soy" type="number" step="0.5" bind:value={params.sprue_offset_y_mm} /><span class="u">mm</span></div>
-							</div>
+							{@render numField('spd', 'Sprue Ø', 'sprue_diameter_mm', 0.5, 2, 30, 'mm')}
+							{#if showTaper}{@render numField('spt', 'Taper', 'sprue_taper_deg', 0.5, 0, 15, '°')}{/if}
+							{#if showFunnel}{@render numField('fnl', 'Funnel top Ø', 'funnel_top_diameter_mm', 1, params.sprue_diameter_mm, 60, 'mm')}{/if}
+							{#if showRunner}{@render numField('run', 'Runner Ø', 'runner_diameter_mm', 0.5, 2, 20, 'mm')}{/if}
+							{@render numField('sox', 'Sprue offset X', 'sprue_offset_x_mm', 0.5, -500, 500, 'mm')}
+							{@render numField('soy', 'Sprue offset Y', 'sprue_offset_y_mm', 0.5, -500, 500, 'mm')}
 						</div>
 						<p class="hint">Keep the pour point over the part or the sprue lands blind.</p>
 					{/if}
 				</section>
 			{/if}
 
-			<!-- VENTS -->
-			{#if tab === 'vents' && !isOnePart}
+			<!-- POUR (jacket / direct funnel / skin) -->
+			{#if tab === 'pour' && hasPour}
+				<section class="grp">
+					<h3>Pour funnel &amp; risers</h3>
+					<div class="g2">
+						{@render numField('pd', 'Pour channel Ø', 'pour_diameter_mm', 1, 4, 40, 'mm')}
+						{@render numField('ptd', 'Funnel top Ø', 'pour_top_diameter_mm', 1, 4, 70, 'mm')}
+						{@render numField('rc', 'Risers', 'riser_count', 1, 0, 6, '')}
+						{@render numField('rd', 'Riser Ø', 'riser_diameter_mm', 0.5, 1.5, 12, 'mm')}
+					</div>
+					<p class="hint">The funnel sits over the master's highest point. Risers are placed automatically on the other high points so trapped air and excess {sys === 'slip' ? 'plaster' : fam === 'direct_funnel' ? 'resin' : 'silicone'} can escape.</p>
+				</section>
+			{/if}
+
+			<!-- VENTS (block) -->
+			{#if tab === 'vents' && isBlock && !isOnePart}
 				<section class="grp">
 					<h3>Venting &amp; air valves</h3>
 					<div class="field">
@@ -1078,18 +1401,9 @@
 
 					{#if showValves}
 						<div class="g3">
-							<div class="field">
-								<label class="lbl" for="vc">Count</label>
-								<div class="num"><input id="vc" type="number" step="1" min="0" max="8" bind:value={params.valve_count} /></div>
-							</div>
-							<div class="field">
-								<label class="lbl" for="vd">Ø</label>
-								<div class="num"><input id="vd" type="number" step="0.5" min="1" max="15" bind:value={params.valve_diameter_mm} /><span class="u">mm</span></div>
-							</div>
-							<div class="field">
-								<label class="lbl" for="vr">Ring</label>
-								<div class="num"><input id="vr" type="number" step="0.05" min="0.1" max="0.9" bind:value={params.valve_ring_factor} /></div>
-							</div>
+							{@render numField('vc', 'Count', 'valve_count', 1, 0, 8, '')}
+							{@render numField('vd', 'Ø', 'valve_diameter_mm', 0.5, 1, 15, 'mm')}
+							{@render numField('vr', 'Ring', 'valve_ring_factor', 0.05, 0.1, 0.9, '')}
 						</div>
 						<p class="hint">Ring: 0.1 = near center · 0.9 = near edge. Keep valves over the part.</p>
 					{/if}
@@ -1109,10 +1423,7 @@
 									<div class="num"><input id="vw" type="number" step="0.1" min="0.3" max="4" bind:value={params.vent_width_mm} /><span class="u">mm</span></div>
 									<p class="hint">Keep ≥ 2× voxel ({fmt(2 * effectiveVoxel, 2)} mm).</p>
 								</div>
-								<div class="field">
-									<label class="lbl" for="vn">Vent count</label>
-									<div class="num"><input id="vn" type="number" step="1" min="1" max="8" bind:value={params.vent_count} /></div>
-								</div>
+								{@render numField('vn', 'Vent count', 'vent_count', 1, 1, 8, '')}
 							</div>
 						{/if}
 					{/if}
@@ -1120,7 +1431,7 @@
 			{/if}
 
 			<!-- KEYS -->
-			{#if tab === 'keys' && !isOnePart}
+			{#if tab === 'keys'}
 				<section class="grp">
 					<h3>Registration keys</h3>
 					<div class="field">
@@ -1130,7 +1441,7 @@
 								<button type="button" class="seg {params.key_shape === o.v ? 'on' : ''}" onclick={() => (params.key_shape = o.v)}>{o.l}</button>
 							{/each}
 						</div>
-						<p class="hint">{#if isSilicone}Bosses on one half, sockets in the other, seated down the mating flange with a solid rim so they never print thin — they lock the two halves in register.{:else}Bosses on one half, sockets in the other — keeps alignment perfect.{/if}</p>
+						<p class="hint">{isBlock ? 'Bosses on one half, sockets in the other — keeps alignment perfect.' : 'Bosses on one piece, sockets in its neighbour, spaced evenly down each mating flange.'}</p>
 					</div>
 
 					{#if params.key_shape !== 'none'}
@@ -1138,7 +1449,7 @@
 							<p class="hint">Keys are placed automatically — one per wedge seam{isSixPart ? ', with caps registering on the seams' : ''}.</p>
 						{/if}
 						<div class="g3">
-							{#if !isRadial}
+							{#if isBlock && !isRadial}
 								<div class="field">
 									<span class="lbl">Count</span>
 									<div class="segs narrow">
@@ -1147,18 +1458,137 @@
 										{/each}
 									</div>
 								</div>
+							{:else if !isBlock}
+								{@render numField('skc', 'Per split', 'split_key_count', 1, 0, 8, '')}
 							{/if}
-							<div class="field">
-								<label class="lbl" for="kd">Ø</label>
-								<div class="num"><input id="kd" type="number" step="0.5" min="3" max="20" bind:value={params.key_diameter_mm} /><span class="u">mm</span></div>
+							{@render numField('kd', 'Ø', 'key_diameter_mm', 0.5, 3, 20, 'mm')}
+							{@render numField('kc', 'Clearance', 'key_clearance_mm', 0.05, 0, 1, 'mm')}
+						</div>
+						<p class="hint">0.1–0.2 mm for FDM, 0.05–0.1 mm for resin.{#if !isBlock} Key size is capped by the collar thickness and reach.{/if}</p>
+					{/if}
+
+					{#if !isBlock}
+						<label class="check" style="margin-top:14px;">
+							<input type="checkbox" bind:checked={params.clamp_holes} />
+							<span><strong>Clamp holes</strong> — holes straight through the mating collars, between the keys, to bolt the pieces shut.</span>
+						</label>
+						{#if params.clamp_holes}
+							<div class="inline">
+								<label for="clh">Hole Ø</label>
+								<div class="num"><input id="clh" type="number" step="0.1" min="2" max="8" bind:value={params.clamp_hole_diameter_mm} /><span class="u">mm</span></div>
 							</div>
-							<div class="field">
-								<label class="lbl" for="kc">Clearance</label>
-								<div class="num"><input id="kc" type="number" step="0.05" min="0" max="1" bind:value={params.key_clearance_mm} /><span class="u">mm</span></div>
+						{/if}
+					{/if}
+				</section>
+			{/if}
+
+			<!-- MASTER -->
+			{#if tab === 'master' && !isBlock}
+				<section class="grp">
+					<h3>Master</h3>
+
+					{#if hasBase}
+						<label class="check">
+							<input type="checkbox" bind:checked={params.master_seat} />
+							<span><strong>Locator socket</strong> — recess the master's footprint into the base so it seats centred with even silicone all round.</span>
+						</label>
+						{#if params.master_seat}
+							<div class="inline">
+								<label for="mclr">Fit clearance</label>
+								<div class="num"><input id="mclr" type="number" step="0.05" min="0" max="2" bind:value={params.master_clearance_mm} /><span class="u">mm</span></div>
+							</div>
+						{/if}
+						<label class="check" style="margin-top:12px;">
+							<input type="checkbox" bind:checked={params.master_seal} />
+							<span><strong>Smart seal</strong> — a thin collar hugs the master where it meets the base, so silicone can't creep underneath.</span>
+						</label>
+						<div class="g2" style="margin-top:14px;">
+							{@render numField('bkc', 'Base keys', 'base_key_count', 1, 0, 8, '')}
+							{@render numField('bkd', 'Base key Ø', 'base_key_diameter_mm', 0.5, 2, 16, 'mm')}
+						</div>
+						<p class="hint">Pockets placed evenly around the master in the base. Silicone fills them, so the finished silicone mould drops back into the jacket in exact register.</p>
+					{/if}
+
+					{#if fam !== 'fixture'}
+						<div class="field" style="margin-top:14px;">
+							<label class="lbl" for="fnd">Foundation</label>
+							<div class="num"><input id="fnd" type="number" step="0.5" min="0" max="20" bind:value={params.foundation_mm} /><span class="u">mm</span></div>
+							<p class="hint">Adds a solid, flat base of this height under the master's footprint so rough or uneven bottoms stand and seal properly. 0 = off.</p>
+						</div>
+					{/if}
+
+					{#if pourFromTop}
+						<label class="check" style="margin-top:6px;">
+							<input type="checkbox" bind:checked={params.air_trap_detect} />
+							<span><strong>Air-trap check</strong> — find pockets under overhangs where rising {fam === 'skin' ? 'material' : sys === 'slip' ? 'plaster' : 'silicone'} would trap air (red markers in the preview).</span>
+						</label>
+						{#if params.air_trap_detect}
+							<label class="check" style="margin-top:10px;">
+								<input type="checkbox" bind:checked={params.air_trap_pillars} />
+								<span><strong>Support pillars</strong> — add thin pillars under each trap so the pocket vents and the master is supported.</span>
+							</label>
+							{#if params.air_trap_pillars}
+								<div class="inline">
+									<label for="pil">Pillar Ø</label>
+									<div class="num"><input id="pil" type="number" step="0.5" min="1.5" max="8" bind:value={params.pillar_diameter_mm} /><span class="u">mm</span></div>
+								</div>
+							{/if}
+						{/if}
+					{/if}
+
+					{#if sys === 'core'}
+						<div class="field" style="margin-top:16px;">
+							<span class="lbl">Inner core</span>
+							<div class="segs">
+								{#each seg.core_mode as o}
+									<button type="button" class="seg {params.core_mode === o.v ? 'on' : ''}" onclick={() => (params.core_mode = o.v)}>{o.l}</button>
+								{/each}
+							</div>
+							<p class="hint">Auto plugs any bore it finds (rings, tubes); otherwise it hollows the master into a vessel: the jacket is left open at the mouth, and the core drops in with a T-bar resting across the rim. The core pulls straight up, so the vessel's opening must face +Z.</p>
+						</div>
+						<div class="g3">
+							{@render numField('cw', 'Cast wall', 'cast_wall_mm', 0.5, 1, 20, 'mm')}
+							{@render numField('cdr', 'Core draft', 'core_draft_deg', 0.5, 0, 10, '°')}
+							{@render numField('trim', 'Top trim', 'top_trim_mm', 0.5, 0, 200, 'mm')}
+						</div>
+						<p class="hint">Cast wall is the minimum wall of the hollow cast. Draft tapers the core so it releases — walls get slightly thicker toward the bottom, and wider below a narrow neck (a one-piece core can only be as wide as the mouth). Top trim cuts the master flat to open or widen the mouth. Toggle “Silicone + cast” in the preview to check the cast.</p>
+					{/if}
+
+					{#if sys === 'slip'}
+						<div class="g2" style="margin-top:16px;">
+							{@render numField('spd2', 'Spare Ø', 'slip_spare_diameter_mm', 1, 0, 120, 'mm')}
+							{@render numField('sph', 'Spare height', 'slip_spare_height_mm', 1, 0, 80, 'mm')}
+							{@render numField('trim', 'Top trim', 'top_trim_mm', 0.5, 0, 200, 'mm')}
+						</div>
+						<p class="hint">The spare is a flared reservoir added on top of the master: it forms the pour opening in the plaster and holds extra slip as the walls build up. Trim cuts the cast top flat before the spare. Spare Ø 0 = off.</p>
+					{/if}
+				</section>
+			{/if}
+
+			<!-- EXTRAS -->
+			{#if tab === 'extras'}
+				<section class="grp">
+					<h3>Branding &amp; labels</h3>
+					<div class="field">
+						<label class="lbl" for="brand">Text</label>
+						<div class="num"><input id="brand" type="text" maxlength="40" placeholder="Your logo text, part no…" bind:value={params.brand_text} /></div>
+					</div>
+					<div class="g2">
+						<div class="field">
+							<span class="lbl">Style</span>
+							<div class="segs">
+								{#each seg.brand_mode as o}
+									<button type="button" class="seg sm {params.brand_mode === o.v ? 'on' : ''}" onclick={() => (params.brand_mode = o.v)}>{o.l}</button>
+								{/each}
 							</div>
 						</div>
-						<p class="hint">0.1–0.2 mm for FDM, 0.05–0.1 mm for resin.</p>
-					{/if}
+						{@render numField('bsz', 'Text height', 'brand_size_mm', 0.5, 3, 30, 'mm')}
+					</div>
+					<label class="check">
+						<input type="checkbox" bind:checked={params.brand_volume_label} />
+						<span><strong>Volume label</strong> — add the {fam === 'silicone' || fam === 'tray' ? 'silicone' : 'casting'} volume (ml) to the mould, so you mix the right amount every time.</span>
+					</label>
+					<p class="hint">Text is placed on the base or outer wall by the server. It isn't drawn in the live preview.</p>
 				</section>
 			{/if}
 
@@ -1181,7 +1611,7 @@
 								<div class="num"><input id="vox" type="number" step="0.05" min="0.15" max="2" bind:value={params.voxel_size_mm} onblur={onVoxelBlur} /><span class="u">mm</span></div>
 							</div>
 						{/if}
-						<p class="hint">Finer voxels capture more detail but take longer. Large parts at fine resolution are auto-coarsened on the server.</p>
+						<p class="hint">Finer voxels capture more detail but take longer. Large parts at fine resolution are auto-coarsened on the server. The live preview always runs at a coarse draft resolution.</p>
 					</div>
 
 					<div class="field">
@@ -1203,7 +1633,7 @@
 	<!-- ===================== CENTRE: VIEWPORT ===================== -->
 	<main class="viewport">
 		{#if file && modelBuffer && active}
-			<MouldPreview {modelBuffer} fileName={file.name} {params} />
+			<MouldPreview {modelBuffer} fileName={file.name} {params} onStats={(s) => (previewStats = s)} />
 		{:else if file && !modelBuffer}
 			<div class="vp-empty"><div class="spinner"></div><p>Reading {file.name}…</p></div>
 		{:else if !file}
@@ -1213,10 +1643,7 @@
 				tabindex="0"
 				onclick={() => fileInputEl.click()}
 				onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), fileInputEl.click())}
-				ondragover={(e) => {
-					e.preventDefault();
-					dragOver = true;
-				}}
+				ondragover={(e) => { e.preventDefault(); dragOver = true; }}
 				ondragleave={() => (dragOver = false)}
 				ondrop={onDrop}>
 				<svg viewBox="0 0 24 24" class="vp-icon" aria-hidden="true">
@@ -1224,7 +1651,7 @@
 					<path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
 				</svg>
 				<p class="vp-t">Drop a 3D model to start</p>
-				<p class="vp-h">STL · 3MF · STEP · up to {MAX_UPLOAD_MB} MB — then tune the mould live</p>
+				<p class="vp-h">STL · 3MF · STEP · up to {MAX_UPLOAD_MB} MB — then pick a mould system and tune it live</p>
 			</div>
 		{/if}
 	</main>
@@ -1236,43 +1663,96 @@
 				<h3>Summary</h3>
 				<div class="rows">
 					<div class="row"><span>Model</span><span class="v">{file ? file.name : '—'}</span></div>
-					<div class="row"><span>Type</span><span class="v">{typeLabel} · {isSilicone ? (isTwoPart ? 'split silicone' : 'silicone tray') : 'block'}{isSilicone && params.silicone_type === 'core' ? ' + core' : ''}</span></div>
-					<div class="row"><span>Pull / parting</span><span class="v">{#if isRadial}{isSixPart ? '4 radial + 2 caps' : 'radial ±X ±Y'}{:else}{params.parting_axis.toUpperCase()}{#if isTwoPart} · {params.parting_mode}{isConformal ? ' · flange' : params.parting_surface === 'follow' ? ' · silhouette' : ''}{/if}{/if}</span></div>
-					{#if isSilicone}
-						<div class="row"><span>Silicone gap</span><span class="v">{params.silicone_gap_mm} mm</span></div>
-						<div class="row"><span>Jacket wall</span><span class="v">{params.box_wall_mm} mm</span></div>
-						<div class="row"><span>Base flange</span><span class="v">{params.base_flange_mm} mm{params.base_flange_mm >= 5 ? ' · bolts' : ''}</span></div>
-						<div class="row"><span>Master seat</span><span class="v">{params.master_seat ? `socket · ${params.master_clearance_mm} mm` : 'none'}</span></div>
-					{:else}
+					<div class="row"><span>System</span><span class="v">{typeLabel}</span></div>
+					{#if isBlock}
+						<div class="row"><span>Pull / parting</span><span class="v">{#if isRadial}{isSixPart ? '4 radial + 2 caps' : 'radial ±X ±Y'}{:else}{params.parting_axis.toUpperCase()}{#if isTwoPart} · {params.parting_mode}{params.parting_surface === 'follow' ? ' · silhouette' : ''}{/if}{/if}</span></div>
 						<div class="row"><span>Wall / clr</span><span class="v">{params.wall_thickness_mm} / {params.cavity_clearance_mm} mm</span></div>
+						<div class="row"><span>Draft / shrink</span><span class="v">{params.draft_angle_deg}° / {params.shrinkage_percent}%</span></div>
+						{#if !isOnePart}
+							<div class="row"><span>Gate</span><span class="v">{params.gate_type === 'none' ? 'None' : `${params.gate_type} · ${params.sprue_type} · Ø${params.sprue_diameter_mm}`}</span></div>
+							<div class="row"><span>Valves</span><span class="v">{params.valve_type === 'none' ? 'None' : `${params.valve_count} × Ø${params.valve_diameter_mm}`}</span></div>
+						{/if}
+						{#if isTwoPart}
+							<div class="row"><span>Keys</span><span class="v">{params.key_shape === 'none' ? 'None' : `${params.key_count} × ${params.key_shape}`}</span></div>
+						{/if}
+					{:else}
+						{#if splitCapable}
+							<div class="row"><span>Splits</span><span class="v">{splitLabel}</span></div>
+						{/if}
+						{#if fam === 'silicone' || fam === 'tray'}
+							<div class="row"><span>{sys === 'slip' ? 'Plaster wall' : 'Silicone gap'}</span><span class="v">{sys === 'slip' ? params.plaster_thickness_mm : params.silicone_gap_mm} mm</span></div>
+							<div class="row"><span>Wall / base</span><span class="v">{params.box_wall_mm} / {params.base_flange_mm} mm · {params.base_style === 'rect' ? 'rect' : 'outline'}</span></div>
+							<div class="row"><span>Master</span><span class="v">{params.master_seat ? 'socket' : 'flat'}{params.master_seal ? ' · seal' : ''}{params.base_key_count ? ` · ${params.base_key_count} base keys` : ''}</span></div>
+						{:else if fam === 'direct_open' || fam === 'direct_funnel'}
+							<div class="row"><span>Clr / wall</span><span class="v">{params.direct_clearance_mm} / {params.direct_wall_mm} mm</span></div>
+						{:else if fam === 'skin'}
+							<div class="row"><span>Skin / wall</span><span class="v">{params.skin_thickness_mm} / {params.box_wall_mm} mm</span></div>
+						{:else if fam === 'fixture'}
+							<div class="row"><span>Pocket</span><span class="v">{params.fixture_depth_pct}% · margin {params.fixture_margin_mm} mm</span></div>
+						{:else if fam === 'shell'}
+							<div class="row"><span>Clr / wall</span><span class="v">{params.shell_clearance_mm} / {params.shell_wall_mm} mm</span></div>
+						{/if}
+						{#if hasPour}
+							<div class="row"><span>Pour</span><span class="v">Ø{params.pour_diameter_mm} funnel · {params.riser_count} risers</span></div>
+						{/if}
+						{#if hasSplits}
+							<div class="row"><span>Keys / clamps</span><span class="v">{params.key_shape === 'none' ? 'no keys' : `${params.split_key_count}/split ${params.key_shape}`}{params.clamp_holes ? ` · Ø${params.clamp_hole_diameter_mm}` : ''}</span></div>
+						{/if}
+						{#if sys === 'core'}
+							<div class="row"><span>Core</span><span class="v">{coreHollow ? 'hollow · T-bar' : params.core_mode === 'auto' ? 'auto' : params.core_mode} · wall {params.cast_wall_mm} mm · {params.core_draft_deg}°</span></div>
+						{/if}
+						{#if sys === 'slip'}
+							<div class="row"><span>Spare</span><span class="v">Ø{params.slip_spare_diameter_mm} × {params.slip_spare_height_mm} mm</span></div>
+						{/if}
+						{#if params.foundation_mm > 0}
+							<div class="row"><span>Foundation</span><span class="v">{params.foundation_mm} mm</span></div>
+						{/if}
 					{/if}
-					{#if showFlange}
-						<div class="row"><span>Flange t / reach</span><span class="v">{params.flange_thickness_mm} / {params.flange_reach_mm} mm</span></div>
-					{/if}
-					<div class="row"><span>Draft / shrink</span><span class="v">{params.draft_angle_deg}° / {params.shrinkage_percent}%</span></div>
-					{#if !isOnePart && !isSilicone}
-						<div class="row"><span>Gate</span><span class="v">{params.gate_type === 'none' ? 'None' : `${params.gate_type} · ${params.sprue_type} · Ø${params.sprue_diameter_mm}`}</span></div>
-						<div class="row"><span>Valves</span><span class="v">{params.valve_type === 'none' ? 'None' : `${params.valve_count} × Ø${params.valve_diameter_mm}`}</span></div>
-					{/if}
-					{#if isTwoPart}
-						<div class="row"><span>Keys</span><span class="v">{params.key_shape === 'none' ? 'None' : `${params.key_count} × ${params.key_shape}`}</span></div>
+					{#if params.brand_text || params.brand_volume_label}
+						<div class="row"><span>Branding</span><span class="v">{params.brand_text ? `“${params.brand_text}”` : ''}{params.brand_volume_label ? (params.brand_text ? ' + ' : '') + 'volume' : ''}</span></div>
 					{/if}
 					<div class="row"><span>Voxel</span><span class="v">{effectiveVoxel} mm</span></div>
 					<div class="row"><span>Precision</span><span class="v">{params.surface_refinement === 'cad_exact' ? 'CAD-exact ±0.01' : 'Voxel'}</span></div>
 				</div>
+
+				{#if !isBlock && file}
+					<div class="est">
+						<p class="est-h">Live estimate <span>from preview</span></p>
+						{#if previewStats}
+							<div class="res">
+								<div class="res-i"><span class="rl">Master</span><span class="rv">{fmt(previewStats.master_cm3, 0)} cm³</span></div>
+								{#if fam !== 'fixture' && fam !== 'shell'}
+									<div class="res-i hl"><span class="rl">{fillName}</span><span class="rv">≈ {fmt(previewStats.fill_cm3, 0)} ml</span></div>
+								{/if}
+								{#if sys === 'core' && previewStats.core_mode === 'hollow'}
+									<div class="res-i"><span class="rl">Hollow cast</span><span class="rv">{fmt(previewStats.cast_cm3, 0)} cm³</span></div>
+								{/if}
+								<div class="res-i"><span class="rl">Printed</span><span class="rv">{fmt(previewStats.printed_cm3, 0)} cm³ · ≈{fmt(previewStats.printed_cm3 * 1.24, 0)} g PLA</span></div>
+								<div class="res-i"><span class="rl">Pieces</span><span class="rv">{piecesText}</span></div>
+								<div class="res-i"><span class="rl">Footprint</span><span class="rv">{previewStats.box_mm.map((v) => fmt(v, 0)).join(' × ')} mm</span></div>
+								{#if pourFromTop && params.air_trap_detect}
+									<div class="res-i {previewStats.air_traps ? 'bad' : ''}"><span class="rl">Air traps</span><span class="rv">{previewStats.air_traps ? `${previewStats.air_traps} found` : 'none'}</span></div>
+								{/if}
+							</div>
+							<p class="note">Solid-voxel estimate at {fmt(previewStats.voxel_mm, 1)} mm; the generated report is exact.{#if fam === 'silicone' && sys !== 'slip'} Mix ~10% extra silicone.{/if}</p>
+						{:else}
+							<p class="note" style="text-align:left;">Building…</p>
+						{/if}
+					</div>
+				{/if}
 
 				<button class="cta" type="button" disabled={!canSubmit} onclick={() => generate()}>
 					{#if phase === 'uploading'}Generating… {elapsed}s{:else if subChecked && !loggedIn}Sign in to generate{:else}Generate mould{/if}
 				</button>
 
 				{#if phase === 'uploading'}
-					<p class="note pulse">Voxelising, sweeping cavities and meshing on the server. Typically 10–60 s.</p>
+					<p class="note pulse">Voxelising, building the mould system and meshing on the server. Typically 10–60 s.</p>
 				{:else if !file}
 					<p class="note">Upload a model to begin.</p>
 				{:else if subChecked && !loggedIn}
 					<p class="note">Generating a mould is free — you just need an account (1 mould/day).</p>
 				{:else if subChecked && !isPremium && !subError}
-					<p class="note">Free plan: 1 mould/day · Two-part box · Draft/Standard voxel. <a href={PRICING_PATH} style="color:#7c3aed;font-weight:600;">Go Pro</a> for silicone, multi-part, Fine/CAD-exact & unlimited.</p>
+					<p class="note">Free plan: 1 mould/day · Two-part box · Draft/Standard voxel. <a href={PRICING_PATH} style="color:#7c3aed;font-weight:600;">Go Pro</a> for every mould system, multi-part, Fine/CAD-exact & unlimited.</p>
 				{:else if subError}
 					<p class="note">{subError} <button class="linkish" type="button" onclick={() => checkSubscription(true)}>Retry</button></p>
 				{/if}
@@ -1293,34 +1773,51 @@
 				<section class="grp">
 					<h3>Result</h3>
 					<div class="res">
-						<div class="res-i"><span class="rl">Part size</span><span class="rv">{fmt(report.part_l_mm, 1)} × {fmt(report.part_w_mm, 1)} × {fmt(report.part_h_mm, 1)} mm</span></div>
-						<div class="res-i"><span class="rl">{report.mould_style === 'silicone_box' ? 'Master volume' : 'Part volume'}</span><span class="rv">{fmt(report.part_volume_cm3)} cm³</span></div>
-						<div class="res-i"><span class="rl">{report.mould_style === 'silicone_box' ? 'Box size' : 'Mould block'}</span><span class="rv">{fmt(report.block_x_mm, 1)} × {fmt(report.block_y_mm, 1)} × {fmt(report.block_z_mm, 1)} mm</span></div>
-						{#if report.mould_style === 'silicone_box'}
-							<div class="res-i hl"><span class="rl">Silicone needed</span><span class="rv">≈ {fmt(report.silicone_volume_cm3, 0)} cm³ ({fmt(report.silicone_volume_cm3, 0)} ml)</span></div>
-						{:else}
-							<div class="res-i"><span class="rl">Casting volume</span><span class="rv">{fmt(report.casting_volume_cm3)} cm³</span></div>
+						{#if report.part_l_mm !== undefined}
+							<div class="res-i"><span class="rl">Part size</span><span class="rv">{fmt(report.part_l_mm, 1)} × {fmt(report.part_w_mm, 1)} × {fmt(report.part_h_mm, 1)} mm</span></div>
 						{/if}
-						{#if report.pieces >= 4}
+						{#if report.part_volume_cm3 !== undefined}
+							<div class="res-i"><span class="rl">{isBlock ? 'Part volume' : 'Master volume'}</span><span class="rv">{fmt(report.part_volume_cm3)} cm³</span></div>
+						{/if}
+						{#if report.block_x_mm !== undefined}
+							<div class="res-i"><span class="rl">{isBlock ? 'Mould block' : 'System size'}</span><span class="rv">{fmt(report.block_x_mm, 1)} × {fmt(report.block_y_mm, 1)} × {fmt(report.block_z_mm, 1)} mm</span></div>
+						{/if}
+						{#if report.silicone_volume_cm3}
+							<div class="res-i hl"><span class="rl">{sys === 'slip' ? 'Plaster needed' : fam === 'skin' ? 'Skin material' : 'Silicone needed'}</span><span class="rv">≈ {fmt(report.silicone_volume_cm3, 0)} ml</span></div>
+						{/if}
+						{#if report.plaster_volume_cm3}
+							<div class="res-i hl"><span class="rl">Plaster needed</span><span class="rv">≈ {fmt(report.plaster_volume_cm3, 0)} ml</span></div>
+						{/if}
+						{#if report.casting_volume_cm3}
+							<div class="res-i"><span class="rl">{sys === 'core' ? 'Hollow cast' : 'Casting volume'}</span><span class="rv">{fmt(report.casting_volume_cm3)} cm³</span></div>
+						{/if}
+						{#if report.pieces >= 4 && isBlock}
 							<div class="res-i"><span class="rl">Pieces</span><span class="rv">{report.pieces === 6 ? '4 wedges + 2 caps' : '4 wedges'}</span></div>
 							<div class="res-i"><span class="rl">Piece vols</span><span class="rv">{fmt(report.mould_a_volume_cm3, 0)} / {fmt(report.mould_b_volume_cm3, 0)} / {fmt(report.mould_c_volume_cm3, 0)} / {fmt(report.mould_d_volume_cm3, 0)}{report.pieces === 6 ? ` / ${fmt(report.mould_e_volume_cm3, 0)} / ${fmt(report.mould_f_volume_cm3, 0)}` : ''} cm³</span></div>
-						{:else}
+						{:else if report.pieces}
+							<div class="res-i"><span class="rl">Pieces</span><span class="rv">{report.pieces}</span></div>
 							{#if report.mould_a_volume_cm3 > 0}
-								<div class="res-i"><span class="rl">{report.mould_style === 'silicone_box' ? 'Top collar' : 'Mould A'}</span><span class="rv">{fmt(report.mould_a_volume_cm3)} cm³</span></div>
+								<div class="res-i"><span class="rl">Piece A</span><span class="rv">{fmt(report.mould_a_volume_cm3)} cm³</span></div>
 							{/if}
 							{#if report.mould_b_volume_cm3 > 0}
-								<div class="res-i"><span class="rl">{report.mould_style === 'silicone_box' ? (report.pieces === 1 ? 'Frame' : 'Base tray') : report.pieces === 1 ? 'Mould' : 'Mould B'}</span><span class="rv">{fmt(report.mould_b_volume_cm3)} cm³</span></div>
+								<div class="res-i"><span class="rl">Piece B</span><span class="rv">{fmt(report.mould_b_volume_cm3)} cm³</span></div>
 							{/if}
 						{/if}
-						<div class="res-i"><span class="rl">Parting</span><span class="rv">{report.parting_surface === 'follow' ? 'Silhouette' : 'Flat'} · Z {fmt(report.parting_z_mm, 2)}</span></div>
-						{#if report.mould_style !== 'silicone_box'}
+						{#if report.parting_z_mm !== undefined && isBlock}
+							<div class="res-i"><span class="rl">Parting</span><span class="rv">{report.parting_surface === 'follow' ? 'Silhouette' : 'Flat'} · Z {fmt(report.parting_z_mm, 2)}</span></div>
+						{/if}
+						{#if isBlock && report.undercut_relief_cm3 !== undefined}
 							<div class="res-i"><span class="rl">Undercut relief</span><span class="rv">{fmt(report.undercut_relief_cm3)} cm³</span></div>
 						{/if}
 						{#if report.refined_vertices > 0}
 							<div class="res-i hl"><span class="rl">CAD-exact</span><span class="rv">{num(report.refined_vertices)} v · rms {fmt(report.refine_rms_mm, 3)}</span></div>
 						{/if}
-						<div class="res-i"><span class="rl">Grid</span><span class="rv">{report.grid ? report.grid.join(' × ') : '—'} @ {fmt(report.voxel_mm, 2)}</span></div>
-						<div class="res-i"><span class="rl">Triangles</span><span class="rv">A {num(report.triangles_out_a)}{#if report.triangles_out_b > 0} · B {num(report.triangles_out_b)}{/if}</span></div>
+						{#if report.grid}
+							<div class="res-i"><span class="rl">Grid</span><span class="rv">{report.grid.join(' × ')} @ {fmt(report.voxel_mm, 2)}</span></div>
+						{/if}
+						{#if report.triangles_out_a !== undefined}
+							<div class="res-i"><span class="rl">Triangles</span><span class="rv">A {num(report.triangles_out_a)}{#if report.triangles_out_b > 0} · B {num(report.triangles_out_b)}{/if}</span></div>
+						{/if}
 					</div>
 
 					{#if report.warnings && report.warnings.length}
@@ -1331,7 +1828,7 @@
 					{#if errorMsg && !downloading && !zipDownloaded}
 						<div class="alert err-a" style="margin-top:10px;"><strong>Download problem</strong><p>{errorMsg}{#if !mouldToken && !downloadUrl} Press <em>Generate mould</em> again to make a fresh package.{/if}</p></div>
 					{/if}
-					<p class="note">{zipDownloaded ? 'Saved to your device — the package is removed from the server once delivered.' : downloading ? 'Fetching the package…' : `The ZIP contains the ${report.mould_style === 'silicone_box' ? 'box STL' : 'mould STL'}${report.pieces > 1 ? 's' : ''} and report.json. It can be downloaded once.`}</p>
+					<p class="note">{zipDownloaded ? 'Saved to your device — the package is removed from the server once delivered.' : downloading ? 'Fetching the package…' : 'The ZIP contains every component as its own ready-to-print STL, plus report.json. It can be downloaded once.'}</p>
 					{#if !isPremium && freeUsedToday}
 						<p class="note">That's today's free mould. <a href={PRICING_PATH} style="color:#7c3aed;font-weight:600;">Upgrade to Pro</a> for unlimited generations.</p>
 					{/if}
@@ -1359,7 +1856,7 @@
 		inset: 0;
 		z-index: 60;
 		display: grid;
-		grid-template-columns: 320px 1fr 300px;
+		grid-template-columns: 340px 1fr 300px;
 		grid-template-rows: 54px auto 1fr;
 		background: var(--soft);
 		color: var(--ink);
@@ -1368,13 +1865,13 @@
 		overflow: hidden;
 	}
 	.bar { grid-column: 1 / -1; display: flex; align-items: center; gap: 18px; padding: 0 16px; background: #fff; border-bottom: 1px solid var(--line); }
-	.brand { display: inline-flex; align-items: center; gap: 9px; font-family: 'Space Grotesk', 'Inter', sans-serif; font-weight: 700; font-size: 15px; color: var(--ink); letter-spacing: -0.01em; }
+	.brand { display: inline-flex; align-items: center; gap: 9px; font-family: 'Space Grotesk', 'Inter', sans-serif; font-weight: 700; font-size: 15px; color: var(--ink); letter-spacing: -0.01em; text-decoration: none; }
 	.brand b { font-weight: 500; color: var(--muted); }
-	.bar-file { display: flex; align-items: center; gap: 8px; margin-left: 6px; }
+	.bar-file { display: flex; align-items: center; gap: 8px; margin-left: 6px; min-width: 0; }
 	.fchip { display: inline-flex; align-items: center; gap: 8px; background: var(--soft); border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; max-width: 260px; }
 	.fname { font-size: 12.5px; font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 	.fsize { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; color: var(--muted); flex: none; }
-	.mini { font-family: inherit; font-size: 12.5px; font-weight: 600; border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 999px; padding: 6px 14px; cursor: pointer; transition: border-color 0.15s; text-decoration: none; }
+	.mini { font-family: inherit; font-size: 12.5px; font-weight: 600; border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 999px; padding: 6px 14px; cursor: pointer; transition: border-color 0.15s; text-decoration: none; white-space: nowrap; }
 	.mini:hover { border-color: var(--violet); }
 	.mini.solid { background: var(--ink); color: #fff; border-color: var(--ink); }
 	.mini.solid.violet { background: #7c3aed; border-color: #7c3aed; }
@@ -1383,7 +1880,7 @@
 	.plan-chip { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }
 	.plan-chip.free { color: var(--muted); background: var(--soft); border: 1px solid var(--line); }
 	.plan-chip.pro { color: #6d28d9; background: #f5f3ff; border: 1px solid #ddd6fe; }
-	.bar-link { margin-left: 16px; font-size: 13px; color: var(--muted); text-decoration: none; }
+	.bar-link { margin-left: 16px; font-size: 13px; color: var(--muted); text-decoration: none; white-space: nowrap; }
 	.bar-link:hover { color: var(--ink); }
 
 	.tabs { grid-column: 1 / -1; grid-row: 2; display: flex; align-items: center; gap: 4px; padding: 8px 16px; background: #fff; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: thin; }
@@ -1417,26 +1914,31 @@
 	.hint { font-size: 12px; color: var(--muted); line-height: 1.5; margin: 8px 0 0; }
 	.hint a { text-decoration: none; }
 	.hint a:hover { text-decoration: underline; }
+	.hint.soon { color: #92400e; background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 7px 10px; }
 	.err { color: #dc2626; font-size: 12.5px; margin: 8px 0 0; }
 
 	.segs { display: flex; flex-wrap: wrap; gap: 6px; }
 	.segs.narrow .seg { min-width: 44px; justify-content: center; }
 	.seg { border: 1px solid var(--line); background: #fff; color: var(--body); border-radius: 8px; padding: 7px 12px; font-size: 12.5px; font-weight: 550; cursor: pointer; transition: all 0.14s; font-family: inherit; display: inline-flex; align-items: center; }
+	.seg.sm { padding: 5px 9px; font-size: 12px; }
+	.segs.narrow .seg.sm { min-width: 34px; }
 	.seg:hover { border-color: #cbd5e1; color: var(--ink); }
 	.seg.on { background: var(--blue); border-color: var(--blue); color: #fff; }
 	.seg.locked { border-style: dashed; border-color: #ddd6fe; color: #94a3b8; background: #fbfaff; }
 	.seg.locked:hover { border-color: #c4b5fd; color: #7c3aed; }
 	.seg.locked.on { background: var(--blue); border-color: var(--blue); color: #fff; }
 	.pro-tag { font-size: 8.5px; font-weight: 800; letter-spacing: 0.06em; color: #7c3aed; background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 4px; padding: 1px 4px; margin-left: 6px; line-height: 1.4; }
-	.seg.on .pro-tag { color: #fff; background: rgba(255,255,255,0.22); border-color: rgba(255,255,255,0.4); }
+	.seg.on .pro-tag { color: #fff; background: rgba(255, 255, 255, 0.22); border-color: rgba(255, 255, 255, 0.4); }
 
 	.mcards { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
-	.mcard { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 5px; border: 1.5px solid var(--line); background: #fff; border-radius: 12px; padding: 11px 12px 10px; cursor: pointer; text-align: left; transition: border-color 0.14s, box-shadow 0.14s, background 0.14s; font-family: inherit; }
-	.mcard:hover { border-color: #c7d2fe; box-shadow: 0 2px 10px rgba(59,130,246,0.08); }
-	.mcard.on { border-color: var(--blue); background: #f5f8ff; box-shadow: 0 2px 12px rgba(59,130,246,0.14); }
+	.mcard { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 5px; border: 1.5px solid var(--line); background: #fff; border-radius: 12px; padding: 10px 12px 10px; cursor: pointer; text-align: left; transition: border-color 0.14s, background 0.14s; font-family: inherit; }
+	.mcard:hover { border-color: #c7d2fe; }
+	.mcard.on { border-color: var(--blue); background: #f5f8ff; }
 	.mcard.locked { border-style: dashed; border-color: #e9d5ff; background: #fbfaff; }
-	.mcard.locked:hover { border-color: #c4b5fd; box-shadow: 0 2px 10px rgba(124,58,237,0.1); }
+	.mcard.locked:hover { border-color: #c4b5fd; }
 	.mcard.locked .pro-tag { position: absolute; top: 8px; right: 8px; margin: 0; }
+	.mcard-grp { font-family: ui-monospace, Menlo, monospace; font-size: 8.5px; letter-spacing: 0.1em; text-transform: uppercase; color: #94a3b8; }
+	.mcard.on .mcard-grp { color: var(--blue-600); }
 	.mcard-ic { width: 26px; height: 26px; stroke: #64748b; fill: #64748b; }
 	.mcard.on .mcard-ic { stroke: var(--blue); fill: var(--blue); }
 	.mcard-ti { font-size: 13px; font-weight: 650; color: var(--ink); line-height: 1.15; }
@@ -1444,7 +1946,16 @@
 	.mcard-tags em { font-style: normal; font-size: 9.5px; font-weight: 600; color: #94a3b8; background: #f1f5f9; border-radius: 5px; padding: 1px 5px; }
 	.mcard.on .mcard-tags em { color: #6366f1; background: #eef2ff; }
 
+	.split-row { border: 1px solid var(--line); border-radius: 10px; padding: 10px 11px; margin-bottom: 8px; background: var(--soft); }
+	.split-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+	.split-n { font-size: 12px; font-weight: 650; color: var(--ink); flex: none; }
+	.x-btn { margin-left: auto; width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line); background: #fff; color: var(--muted); font-size: 15px; line-height: 1; cursor: pointer; font-family: inherit; }
+	.x-btn:hover { color: #dc2626; border-color: #fecaca; }
+	.add-btn { width: 100%; border: 1.5px dashed #cbd5e1; background: #fff; color: var(--body); border-radius: 10px; padding: 9px; font-family: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+	.add-btn:hover { border-color: var(--blue); color: var(--blue-600); }
+
 	.g2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+	.g2.tight { gap: 10px; margin-bottom: 0; }
 	.g3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 14px; }
 	.g2 .field, .g3 .field { margin-bottom: 0; }
 	.num { display: flex; align-items: center; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: #fff; transition: border-color 0.15s; }
@@ -1460,13 +1971,13 @@
 	.check input { margin-top: 2px; width: 15px; height: 15px; accent-color: var(--blue); cursor: pointer; flex: none; }
 	.check strong { color: var(--ink); font-weight: 600; }
 
-	.viewport { grid-row: 3; position: relative; min-width: 0; min-height: 0; background: radial-gradient(ellipse at 30% 20%, #f8fafc 0%, #eef2f7 100%); }
+	.viewport { grid-row: 3; position: relative; min-width: 0; min-height: 0; background: #eef2f7; }
 	.vp-drop, .vp-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; text-align: center; color: var(--muted); }
-	.vp-drop { cursor: pointer; margin: 22px; inset: 0; border: 2px dashed #cbd5e1; border-radius: 20px; transition: border-color 0.15s, background 0.15s; }
-	.vp-drop.over { border-color: var(--violet); background: rgba(139,92,246,0.05); }
+	.vp-drop { cursor: pointer; margin: 22px; border: 2px dashed #cbd5e1; border-radius: 20px; transition: border-color 0.15s, background 0.15s; }
+	.vp-drop.over { border-color: var(--violet); background: #f5f3ff; }
 	.vp-icon { width: 40px; height: 40px; color: #94a3b8; margin-bottom: 8px; }
 	.vp-t { font-family: 'Space Grotesk', 'Inter', sans-serif; font-size: 18px; font-weight: 600; color: var(--ink); margin: 0; }
-	.vp-h { font-size: 13px; margin: 0; }
+	.vp-h { font-size: 13px; margin: 0; padding: 0 16px; }
 	.spinner { width: 26px; height: 26px; border: 3px solid #e2e8f0; border-top-color: var(--blue); border-radius: 50%; animation: spin 0.8s linear infinite; }
 	@keyframes spin { to { transform: rotate(360deg); } }
 
@@ -1475,7 +1986,12 @@
 	.rows { display: flex; flex-direction: column; margin-bottom: 8px; }
 	.row { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid #f1f5f9; font-size: 12.5px; color: var(--muted); }
 	.row:last-child { border-bottom: none; }
-	.row .v { color: var(--ink); font-weight: 550; text-align: right; max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.row .v { color: var(--ink); font-weight: 550; text-align: right; max-width: 64%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+	.est { margin-top: 10px; border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: var(--soft); }
+	.est-h { margin: 0 0 10px; font-size: 12.5px; font-weight: 650; color: var(--ink); }
+	.est-h span { font-family: ui-monospace, Menlo, monospace; font-size: 9.5px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-left: 6px; }
+	.est .note { text-align: left; }
 
 	.cta { width: 100%; margin-top: 14px; background: var(--ink); color: #fff; border: none; border-radius: 10px; padding: 12px 20px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; transition: opacity 0.15s, transform 0.1s; }
 	.cta:hover:not(:disabled) { opacity: 0.92; }
@@ -1502,11 +2018,12 @@
 	.res { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px; }
 	.res-i { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 	.res-i.hl .rv { color: var(--violet); }
+	.res-i.bad .rv { color: #dc2626; }
 	.rl { font-family: ui-monospace, Menlo, monospace; font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
 	.rv { font-size: 12.5px; font-weight: 550; color: var(--ink); }
 
 	@media (max-width: 1100px) {
-		.studio { grid-template-columns: 300px 1fr; grid-template-rows: 54px auto 1fr auto; }
+		.studio { grid-template-columns: 320px 1fr; grid-template-rows: 54px auto 1fr auto; }
 		.inspector { grid-column: 1 / -1; grid-row: 4; border-left: none; border-top: 1px solid var(--line); max-height: 42vh; }
 	}
 	@media (max-width: 720px) {
@@ -1516,6 +2033,7 @@
 		.props { grid-row: 4; border-right: none; border-top: 1px solid var(--line); }
 		.inspector { grid-row: 5; max-height: none; }
 		.bar-link { display: none; }
+		.bar { gap: 10px; }
 	}
 	@media (prefers-reduced-motion: reduce) {
 		.spinner, .pulse { animation: none; }
